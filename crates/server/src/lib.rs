@@ -2711,6 +2711,36 @@ where
             }
             return Ok(Self::link_result_from_info(&info));
         }
+        #[cfg(feature = "backend-github")]
+        if let Some(github) = storage.as_any().downcast_ref::<GithubStorage>() {
+            let mut info = github
+                .link_external_folder(
+                    &project,
+                    &params.path,
+                    params.include.clone(),
+                    params.exclude.clone(),
+                    params.watch_mode.as_deref(),
+                    params.poll_interval_ms,
+                    params.jitter_pct,
+                )
+                .map_err(|e| e.to_string())?;
+
+            if params.rescan.unwrap_or(true) {
+                let filters = vec![info.resolved_path.clone()];
+                let _ = github
+                    .rescan_external_folders(&project, Some(&filters))
+                    .map_err(|e| e.to_string())?;
+                if let Some(updated) = github
+                    .list_external_folders(Some(&project))
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.link_id == info.link_id)
+                {
+                    info = updated;
+                }
+            }
+            return Ok(Self::link_result_from_info(&info));
+        }
         Err("external folder linking not supported for this backend".into())
     }
 
@@ -2724,6 +2754,20 @@ where
         #[cfg(feature = "backend-local")]
         if let Some(local) = storage.as_any().downcast_ref::<LocalStorage>() {
             let removed = local
+                .unlink_external_folder(&project, params.path.as_deref())
+                .map_err(|e| e.to_string())?;
+            return Ok(proto::UnlinkFolderResult {
+                project,
+                removed: if removed.is_empty() {
+                    None
+                } else {
+                    Some(removed)
+                },
+            });
+        }
+        #[cfg(feature = "backend-github")]
+        if let Some(github) = storage.as_any().downcast_ref::<GithubStorage>() {
+            let removed = github
                 .unlink_external_folder(&project, params.path.as_deref())
                 .map_err(|e| e.to_string())?;
             return Ok(proto::UnlinkFolderResult {
@@ -2755,6 +2799,17 @@ where
                 .collect();
             return Ok(converted);
         }
+        #[cfg(feature = "backend-github")]
+        if let Some(github) = storage.as_any().downcast_ref::<GithubStorage>() {
+            let infos = github
+                .list_external_folders(project)
+                .map_err(|e| e.to_string())?;
+            let converted = infos
+                .into_iter()
+                .map(|info| Self::link_descriptor_from_info(&info))
+                .collect();
+            return Ok(converted);
+        }
         Err("external folder linking not supported for this backend".into())
     }
 
@@ -2768,6 +2823,17 @@ where
         #[cfg(feature = "backend-local")]
         if let Some(local) = storage.as_any().downcast_ref::<LocalStorage>() {
             let reports = local
+                .rescan_external_folders(project, paths)
+                .map_err(|e| e.to_string())?;
+            let converted = reports
+                .into_iter()
+                .map(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(converted);
+        }
+        #[cfg(feature = "backend-github")]
+        if let Some(github) = storage.as_any().downcast_ref::<GithubStorage>() {
+            let reports = github
                 .rescan_external_folders(project, paths)
                 .map_err(|e| e.to_string())?;
             let converted = reports

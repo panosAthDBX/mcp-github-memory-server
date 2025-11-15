@@ -10,15 +10,18 @@ use std::{
 #[cfg(feature = "remote-git")]
 use std::sync::Arc;
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Utc};
 use mcp_gitmem_core::{
-    model::Memory,
+    model::{Memory, SourceMeta},
     project::{sanitize_project_id, ProjectId, DEFAULT_PROJECT_ID},
     traits::Storage,
 };
+use mcp_gitmem_storage_local::{LinkedFolderInfo, RescanReport};
 use parking_lot::RwLock;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 #[derive(Debug, Error)]
 pub enum GithubError {
@@ -56,6 +59,120 @@ struct CredentialConfig {
 struct Manifest {
     ids: HashMap<String, String>,
     recent: VecDeque<String>,
+}
+
+// External folder linking structures
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct LinkRegistry {
+    entries: Vec<LinkEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LinkEntry {
+    #[serde(default = "LinkEntry::generate_id")]
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<String>,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    include: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclude: Option<Vec<String>>,
+    #[serde(default)]
+    mappings: HashMap<String, String>, // relative file -> memory id
+    watch: LinkWatchSettings,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "lastScan", default, skip_serializing_if = "Option::is_none")]
+    last_scan: Option<String>,
+    #[serde(rename = "lastError", default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    #[serde(rename = "fileCount", default)]
+    file_count: u64,
+    #[serde(rename = "totalBytes", default)]
+    total_bytes: u64,
+    #[serde(
+        rename = "lastRuntimeMs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    last_runtime_ms: Option<u64>,
+}
+
+impl LinkEntry {
+    fn generate_id() -> String {
+        format!("lf_{}", uuid::Uuid::new_v4().simple())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum WatchMode {
+    #[serde(rename = "poll")]
+    Poll,
+}
+
+impl Default for WatchMode {
+    fn default() -> Self {
+        Self::Poll
+    }
+}
+
+impl WatchMode {
+    fn parse(input: &str) -> Result<Self, GithubError> {
+        match input.to_lowercase().as_str() {
+            "poll" => Ok(WatchMode::Poll),
+            other => Err(GithubError::Io(format!(
+                "unknown watch mode '{}'; supported: poll",
+                other
+            ))),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            WatchMode::Poll => "poll",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LinkWatchSettings {
+    #[serde(default)]
+    mode: WatchMode,
+    #[serde(rename = "pollIntervalMs")]
+    poll_interval_ms: u64,
+    #[serde(rename = "jitterPct")]
+    jitter_pct: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+}
+
+impl Default for LinkWatchSettings {
+    fn default() -> Self {
+        Self {
+            mode: WatchMode::Poll,
+            poll_interval_ms: 30_000,
+            jitter_pct: 20,
+            platform: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LinkScanStats {
+    scanned: usize,
+    created: usize,
+    updated: usize,
+    deleted: usize,
+    total_bytes: u64,
+    file_count: u64,
+}
+
+#[derive(Default, Clone, Deserialize)]
+struct FrontMatter {
+    title: Option<String>,
+    tags: Option<Vec<String>>,
+    r#type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1386,4 +1503,605 @@ impl GithubStorage {
         *self.manifests.write() = manifests_map;
         Ok(())
     }
+
+    // External folder linking support with GitHub commit/push integration
+    pub fn link_external_folder(
+        &self,
+        project: &ProjectId,
+        path: &str,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        watch_mode: Option<&str>,
+        poll_interval_ms: Option<u64>,
+        jitter_pct: Option<u32>,
+    ) -> Result<LinkedFolderInfo, GithubError> {
+        let project = sanitize_project_id(project);
+        self.ensure_project_dirs(&project)?;
+        
+        let resolved = Self::resolve_external_path(path)?;
+        if !resolved.is_dir() {
+            return Err(GithubError::Io(format!(
+                "linked path {} is not a directory",
+                resolved.display()
+            )));
+        }
+        if resolved.starts_with(&self.workdir) {
+            return Err(GithubError::Io(
+                "cannot link a directory inside the GitHub storage root".into(),
+            ));
+        }
+
+        let mut registry = self.load_links(&project)?;
+        if registry
+            .entries
+            .iter()
+            .any(|entry| Path::new(&entry.path) == resolved)
+        {
+            return Err(GithubError::Io("folder already linked".into()));
+        }
+
+        let watch = Self::create_watch_settings(watch_mode, poll_interval_ms, jitter_pct)?;
+        let include_clean = include.clone().filter(|v| !v.is_empty());
+        let exclude_clean = exclude.clone().filter(|v| !v.is_empty());
+        let now = Self::now_timestamp();
+        let link_id = LinkEntry::generate_id();
+        let display = Some(path.to_string());
+        
+        let entry = LinkEntry {
+            id: link_id.clone(),
+            display: display.clone(),
+            path: resolved.to_string_lossy().to_string(),
+            include: include_clean.clone(),
+            exclude: exclude_clean.clone(),
+            mappings: HashMap::new(),
+            watch: watch.clone(),
+            created_at: now.clone(),
+            last_scan: None,
+            last_error: None,
+            file_count: 0,
+            total_bytes: 0,
+            last_runtime_ms: None,
+        };
+        
+        registry.entries.push(entry);
+        self.save_links(&project, &registry)?;
+
+        Ok(LinkedFolderInfo {
+            project,
+            path: display.clone().unwrap_or_else(|| path.to_string()),
+            display_path: display,
+            resolved_path: resolved.to_string_lossy().to_string(),
+            include,
+            exclude,
+            link_id,
+            watch: mcp_gitmem_storage_local::LinkWatchSettings::default(), // Convert from our internal type
+            created_at: now,
+            last_scan: None,
+            last_error: None,
+            file_count: 0,
+            total_bytes: 0,
+            status: "idle".into(),
+            last_runtime_ms: None,
+        })
+    }
+
+    pub fn unlink_external_folder(
+        &self,
+        project: &ProjectId,
+        path: Option<&str>,
+    ) -> Result<Vec<String>, GithubError> {
+        let project = sanitize_project_id(project);
+        let mut registry = self.load_links(&project)?;
+        if registry.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let mut removed = Vec::new();
+        match path {
+            Some(p) => {
+                let resolved = Self::resolve_external_path(p)?;
+                registry.entries.retain(|entry| {
+                    let keep = Path::new(&entry.path) != resolved;
+                    if !keep {
+                        removed.push(entry.display.clone().unwrap_or_else(|| entry.path.clone()));
+                    }
+                    keep
+                });
+            }
+            None => {
+                removed.extend(
+                    registry
+                        .entries
+                        .iter()
+                        .map(|e| e.display.clone().unwrap_or_else(|| e.path.clone())),
+                );
+                registry.entries.clear();
+            }
+        }
+        self.save_links(&project, &registry)?;
+        Ok(removed)
+    }
+
+    pub fn list_external_folders(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<Vec<LinkedFolderInfo>, GithubError> {
+        let mut out = Vec::new();
+        if let Some(project) = project {
+            let project = sanitize_project_id(project);
+            let registry = self.load_links(&project)?;
+            out.extend(self.links_to_info(&project, &registry));
+            return Ok(out);
+        }
+
+        let projects = self.list_projects()?;
+        for proj in projects {
+            let registry = self.load_links(&proj)?;
+            out.extend(self.links_to_info(&proj, &registry));
+        }
+        Ok(out)
+    }
+
+    pub fn rescan_external_folders(
+        &self,
+        project: &ProjectId,
+        filter_paths: Option<&[String]>,
+    ) -> Result<Vec<RescanReport>, GithubError> {
+        let project = sanitize_project_id(project);
+        self.ensure_project_dirs(&project)?;
+        let mut registry = self.load_links(&project)?;
+        if registry.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let filter: Option<HashSet<PathBuf>> = filter_paths.map(|paths| {
+            paths
+                .iter()
+                .filter_map(|p| Self::resolve_external_path(p).ok())
+                .collect()
+        });
+
+        let mut reports = Vec::new();
+        
+        for entry in registry.entries.iter_mut() {
+            if let Some(ref filter) = filter {
+                if !filter.contains(Path::new(&entry.path)) {
+                    continue;
+                }
+            }
+            
+            let started = Instant::now();
+            let now_ts = Self::now_timestamp();
+            let mut report = RescanReport {
+                project: project.clone(),
+                path: entry.path.clone(),
+                display_path: entry.display.clone(),
+                link_id: entry.id.clone(),
+                scanned: 0,
+                created: 0,
+                updated: 0,
+                deleted: 0,
+                include: entry.include.clone(),
+                exclude: entry.exclude.clone(),
+                total_bytes: 0,
+                runtime_ms: 0,
+                last_error: None,
+            };
+
+            let dir_path = PathBuf::from(&entry.path);
+            if !dir_path.exists() {
+                let err = format!("directory missing: {}", entry.path);
+                entry.last_error = Some(err.clone());
+                entry.last_scan = Some(now_ts.clone());
+                let runtime_ms = started.elapsed().as_millis() as u64;
+                entry.last_runtime_ms = Some(runtime_ms);
+                report.runtime_ms = runtime_ms;
+                report.last_error = Some(err);
+                reports.push(report);
+                continue;
+            }
+
+            let scan_result = self.scan_linked_directory(&project, entry);
+            let runtime_ms = started.elapsed().as_millis() as u64;
+            entry.last_scan = Some(now_ts.clone());
+            entry.last_runtime_ms = Some(runtime_ms);
+
+            match scan_result {
+                Ok(stats) => {
+                    entry.last_error = None;
+                    entry.file_count = stats.file_count;
+                    entry.total_bytes = stats.total_bytes;
+                    report.scanned = stats.scanned;
+                    report.created = stats.created;
+                    report.updated = stats.updated;
+                    report.deleted = stats.deleted;
+                    report.total_bytes = stats.total_bytes;
+                    report.runtime_ms = runtime_ms;
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    entry.last_error = Some(message.clone());
+                    report.runtime_ms = runtime_ms;
+                    report.last_error = Some(message);
+                }
+            }
+
+            reports.push(report);
+        }
+        
+        self.save_links(&project, &registry)?;
+        
+        // Note: Commits for created/updated/deleted memories are already handled
+        // by the save(), update(), and delete() methods of the Storage trait.
+        // Auto-push is handled automatically by the storage layer if enabled.
+        
+        Ok(reports)
+    }
+
+    // Helper methods for folder linking
+    fn load_links(&self, project: &ProjectId) -> Result<LinkRegistry, GithubError> {
+        let path = self.meta_root.join(project).join("links.json");
+        if !path.exists() {
+            return Ok(LinkRegistry::default());
+        }
+        let data = fs::read(&path).map_err(|e| GithubError::Io(e.to_string()))?;
+        serde_json::from_slice(&data).map_err(|e| GithubError::Serde(e.to_string()))
+    }
+
+    fn save_links(&self, project: &ProjectId, registry: &LinkRegistry) -> Result<(), GithubError> {
+        let dir = self.meta_root.join(project);
+        fs::create_dir_all(&dir).map_err(|e| GithubError::Io(e.to_string()))?;
+        let path = dir.join("links.json");
+        let data = serde_json::to_vec_pretty(registry)
+            .map_err(|e| GithubError::Serde(e.to_string()))?;
+        fs::write(&path, &data).map_err(|e| GithubError::Io(e.to_string()))
+    }
+
+    fn links_to_info(&self, project: &ProjectId, registry: &LinkRegistry) -> Vec<LinkedFolderInfo> {
+        registry
+            .entries
+            .iter()
+            .map(|entry| LinkedFolderInfo {
+                project: project.clone(),
+                path: entry.display.clone().unwrap_or_else(|| entry.path.clone()),
+                display_path: entry.display.clone(),
+                resolved_path: entry.path.clone(),
+                include: entry.include.clone(),
+                exclude: entry.exclude.clone(),
+                link_id: entry.id.clone(),
+                watch: mcp_gitmem_storage_local::LinkWatchSettings::default(),
+                created_at: entry.created_at.clone(),
+                last_scan: entry.last_scan.clone(),
+                last_error: entry.last_error.clone(),
+                file_count: entry.file_count,
+                total_bytes: entry.total_bytes,
+                status: if entry.last_error.is_some() {
+                    "error".into()
+                } else {
+                    "polling".into()
+                },
+                last_runtime_ms: entry.last_runtime_ms,
+            })
+            .collect()
+    }
+
+    fn scan_linked_directory(
+        &self,
+        project: &ProjectId,
+        entry: &mut LinkEntry,
+    ) -> Result<LinkScanStats, GithubError> {
+        let mut stats = LinkScanStats::default();
+        let dir_path = PathBuf::from(&entry.path);
+        let include_patterns = Self::compile_patterns(entry.include.as_ref())?;
+        let exclude_patterns = Self::compile_patterns(entry.exclude.as_ref())?;
+
+        let mut new_mappings = HashMap::new();
+        let mut visited_files = HashSet::new();
+        
+        for walk_entry in walkdir::WalkDir::new(&dir_path).into_iter().filter_map(Result::ok) {
+            if walk_entry.file_type().is_dir() {
+                continue;
+            }
+            let file_path = walk_entry.path();
+            if Self::should_skip(file_path) {
+                continue;
+            }
+            let rel = match file_path.strip_prefix(&dir_path) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !Self::pattern_matches(&include_patterns, &rel_str, true) {
+                continue;
+            }
+            if Self::pattern_matches(&exclude_patterns, &rel_str, false) {
+                continue;
+            }
+            
+            visited_files.insert(rel_str.clone());
+            stats.scanned += 1;
+            
+            let mem_id = Self::linked_memory_id(project, &entry.path, &rel_str);
+            let memory = self.memory_from_file(project, &mem_id, &entry.id, &rel_str, file_path)?;
+            
+            let existed = self.get(project, &mem_id).map_err(|e| GithubError::Io(e.to_string()))?;
+            if let Some(mut existing) = existed {
+                if existing.content != memory.content
+                    || existing.title != memory.title
+                    || existing.tags != memory.tags
+                {
+                    existing.content = memory.content;
+                    existing.title = memory.title;
+                    existing.tags = memory.tags;
+                    existing.updated_at = memory.updated_at;
+                    existing.source = memory.source.clone();
+                    existing.version += 1;
+                    self.update(project, &existing)?;
+                    stats.updated += 1;
+                }
+            } else {
+                self.save(project, &memory)?;
+                stats.created += 1;
+            }
+            
+            new_mappings.insert(rel_str, mem_id);
+            if let Some(size) = memory.source.as_ref().and_then(|src| src.file_size) {
+                stats.total_bytes = stats.total_bytes.saturating_add(size);
+            }
+        }
+
+        // Delete memories for files that no longer exist
+        for (rel, mem_id) in entry.mappings.iter() {
+            if !visited_files.contains(rel) {
+                if self.delete(project, mem_id, true).is_ok() {
+                    stats.deleted += 1;
+                }
+            }
+        }
+
+        entry.mappings = new_mappings;
+        stats.file_count = visited_files.len() as u64;
+        Ok(stats)
+    }
+
+    fn memory_from_file(
+        &self,
+        project: &ProjectId,
+        mem_id: &str,
+        link_id: &str,
+        rel_path: &str,
+        path: &Path,
+    ) -> Result<Memory, GithubError> {
+        let mut data = String::new();
+        File::open(path)
+            .map_err(|e| GithubError::Io(e.to_string()))?
+            .read_to_string(&mut data)
+            .map_err(|e| GithubError::Io(e.to_string()))?;
+
+        let (front_matter_raw, body) = Self::extract_front_matter(&data);
+        let parsed_front = front_matter_raw
+            .and_then(|fm| Self::parse_front_matter(fm).transpose())
+            .transpose()?;
+
+        let mut memory = Memory::new(mem_id, &body, "note");
+        memory.tags.push(format!("project:{}", project));
+        memory.tags.push("linked".into());
+
+        if let Some((front, json_value)) = parsed_front {
+            if let Some(title) = front.title {
+                memory.title = title;
+            }
+            if let Some(tags) = front.tags {
+                memory.tags.extend(tags);
+            }
+            if let Some(mem_type) = front.r#type {
+                memory.r#type = mem_type;
+            }
+            memory.source = Some(SourceMeta {
+                agent: Some("gitmem-linked-folder".into()),
+                session: None,
+                origin: Some("linked_folder".into()),
+                app: None,
+                front_matter: Some(json_value),
+                file_uri: None,
+                relative_path: Some(rel_path.to_string()),
+                checksum_sha256: None,
+                linked_folder_id: Some(link_id.to_string()),
+                file_mtime: None,
+                file_size: None,
+            });
+        } else {
+            memory.source = Some(SourceMeta {
+                agent: Some("gitmem-linked-folder".into()),
+                session: None,
+                origin: Some("linked_folder".into()),
+                app: None,
+                front_matter: None,
+                file_uri: None,
+                relative_path: Some(rel_path.to_string()),
+                checksum_sha256: None,
+                linked_folder_id: Some(link_id.to_string()),
+                file_mtime: None,
+                file_size: None,
+            });
+        }
+
+        // Compute checksum
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(data.as_bytes());
+        let checksum = hex::encode(hasher.finalize());
+        if let Some(ref mut source_meta) = memory.source {
+            source_meta.checksum_sha256 = Some(checksum);
+        }
+
+        // Set file URI and metadata
+        if let Some(ref mut source_meta) = memory.source {
+            if let Ok(abs) = path.canonicalize() {
+                if let Ok(url) = Url::from_file_path(&abs) {
+                    source_meta.file_uri = Some(url.to_string());
+                }
+            }
+
+            let metadata = path.metadata().map_err(|e| GithubError::Io(e.to_string()))?;
+            source_meta.file_size = Some(metadata.len());
+            if let Ok(modified) = metadata.modified() {
+                let dt: DateTime<Utc> = modified.into();
+                source_meta.file_mtime = Some(dt.to_rfc3339());
+                memory.created_at = dt;
+                memory.updated_at = dt;
+            }
+        }
+
+        Ok(memory)
+    }
+
+    // Static helper methods
+    fn resolve_external_path(path: &str) -> Result<PathBuf, GithubError> {
+        let expanded = if path.starts_with('~') {
+            if path == "~" {
+                Self::home_dir()?
+            } else {
+                let home = Self::home_dir()?;
+                home.join(path.trim_start_matches("~/"))
+            }
+        } else {
+            PathBuf::from(path)
+        };
+        let canonical = fs::canonicalize(&expanded).unwrap_or(expanded.clone());
+        Ok(canonical)
+    }
+
+    fn should_skip(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name.starts_with('.') || name.ends_with('~'))
+            .unwrap_or(false)
+    }
+
+    fn compile_patterns(patterns: Option<&Vec<String>>) -> Result<Option<Vec<Regex>>, GithubError> {
+        let patterns = match patterns {
+            Some(list) if !list.is_empty() => list,
+            _ => return Ok(None),
+        };
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for pat in patterns {
+            let regex = Regex::new(&Self::wildcard_to_regex(pat))
+                .map_err(|e| GithubError::Io(e.to_string()))?;
+            compiled.push(regex);
+        }
+        Ok(Some(compiled))
+    }
+
+    fn pattern_matches(
+        patterns: &Option<Vec<Regex>>,
+        candidate: &str,
+        default_value: bool,
+    ) -> bool {
+        match patterns {
+            Some(list) if !list.is_empty() => list.iter().any(|re| re.is_match(candidate)),
+            _ => default_value,
+        }
+    }
+
+    fn wildcard_to_regex(pattern: &str) -> String {
+        let mut regex = String::from("^");
+        for ch in pattern.chars() {
+            match ch {
+                '*' => regex.push_str(".*"),
+                '?' => regex.push('.'),
+                '.' => regex.push_str("\\."),
+                '\\' => regex.push_str("\\\\"),
+                other => regex.push_str(&regex::escape(&other.to_string())),
+            }
+        }
+        regex.push('$');
+        regex
+    }
+
+    fn home_dir() -> Result<PathBuf, GithubError> {
+        if let Ok(path) = std::env::var("HOME") {
+            return Ok(PathBuf::from(path));
+        }
+        if let Ok(path) = std::env::var("USERPROFILE") {
+            return Ok(PathBuf::from(path));
+        }
+        Err(GithubError::Io("HOME not set".into()))
+    }
+
+    fn now_timestamp() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn linked_memory_id(project: &str, root: &str, rel: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(project.as_bytes());
+        hasher.update(b"::");
+        hasher.update(root.as_bytes());
+        hasher.update(b"::");
+        hasher.update(rel.as_bytes());
+        format!("mem_link_{}", hex::encode(hasher.finalize()))
+    }
+
+    fn extract_front_matter(data: &str) -> (Option<&str>, String) {
+        if !data.starts_with("---") {
+            return (None, data.to_string());
+        }
+        let mut cursor = &data[3..];
+        if cursor.starts_with('\r') {
+            cursor = &cursor[1..];
+        }
+        if cursor.starts_with('\n') {
+            cursor = &cursor[1..];
+        } else {
+            return (None, data.to_string());
+        }
+        if let Some((front, remainder)) = cursor.split_once("\n---") {
+            let mut body = remainder;
+            if body.starts_with('\r') {
+                body = &body[1..];
+            }
+            if body.starts_with('\n') {
+                body = &body[1..];
+            }
+            return (Some(front.trim_end()), body.to_string());
+        }
+        (None, data.to_string())
+    }
+
+    fn parse_front_matter(
+        fm: &str,
+    ) -> Result<Option<(FrontMatter, serde_json::Value)>, GithubError> {
+        if fm.trim().is_empty() {
+            return Ok(None);
+        }
+        let yaml: serde_yaml::Value = serde_yaml::from_str(fm)
+            .map_err(|e| GithubError::Serde(format!("front matter parse error: {}", e)))?;
+        let front: FrontMatter = serde_yaml::from_value(yaml.clone())
+            .map_err(|e| GithubError::Serde(format!("front matter decode error: {}", e)))?;
+        let json = serde_json::to_value(yaml)
+            .map_err(|e| GithubError::Serde(format!("front matter json error: {}", e)))?;
+        Ok(Some((front, json)))
+    }
+
+    fn create_watch_settings(
+        watch_mode: Option<&str>,
+        poll_interval_ms: Option<u64>,
+        jitter_pct: Option<u32>,
+    ) -> Result<LinkWatchSettings, GithubError> {
+        let mode = if let Some(mode_str) = watch_mode {
+            WatchMode::parse(mode_str)?
+        } else {
+            WatchMode::default()
+        };
+        
+        Ok(LinkWatchSettings {
+            mode,
+            poll_interval_ms: poll_interval_ms.unwrap_or(30_000),
+            jitter_pct: jitter_pct.unwrap_or(20),
+            platform: None,
+        })
+    }
+
 }

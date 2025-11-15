@@ -6,6 +6,7 @@ Welcome to the documentation for the MCP GitHub Memory Server!
 
 ### Getting Started
 - **[Installation Guide](INSTALL.md)** - Step-by-step installation instructions
+- **[Daemon Setup](DAEMON_SETUP.md)** - Run as a daemon with WebSocket/HTTP transport
 - **[README](../README.md)** - Project overview and quick start
 
 ### Technical Documentation
@@ -23,6 +24,7 @@ Welcome to the documentation for the MCP GitHub Memory Server!
 ### Troubleshooting
 - **[Auto-Push Fix](troubleshooting/auto-push-fix.md)** - Fix GitHub authentication issues
 - **[macOS Security](troubleshooting/macos-security.md)** - Resolve "Killed: 9" errors on macOS
+- **[Cursor Transport (Stdio vs HTTP)](troubleshooting/cursor-stdio-vs-http.md)** - Why Cursor needs stdio mode
 
 ### Development Notes
 - **[Status Updates](notes/)** - Development progress and notes
@@ -35,6 +37,7 @@ docs/
 ├── SPEC.md                             # Technical specification
 ├── AGENTS.md                           # Development guide
 ├── INSTALL.md                          # Installation instructions
+├── DAEMON_SETUP.md                     # Daemon mode with WebSocket/HTTP
 ├── CHANGELOG.md                        # Version history
 ├── IMPLEMENTATION_PLAN.md              # Original implementation plan
 ├── implementation-plan.md              # Updated implementation plan
@@ -44,7 +47,8 @@ docs/
 │   └── guide.md                       # Migration from basic memory
 ├── troubleshooting/
 │   ├── auto-push-fix.md              # GitHub auth issues
-│   └── macos-security.md             # macOS security fixes
+│   ├── macos-security.md             # macOS security fixes
+│   └── cursor-stdio-vs-http.md       # Cursor transport modes
 └── notes/
     └── 2025-10-27-status.md          # Development status
 ```
