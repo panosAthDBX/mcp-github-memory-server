@@ -1,0 +1,88 @@
+# Rust / Cargo
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+.cargo_home/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Data and temporary files
+tmp/
+data/
+*.log
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# Benchmark results
+target/criterion/
+
+# Documentation build
+target/doc/
+
+# Release binaries
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Logs
+*.log
+logs/
+
+# Local configuration (keep examples)
+config.local.yaml
+config.local.toml
+gitmem.local.yaml
+
+# Backup files
+*.bak
+*.backup

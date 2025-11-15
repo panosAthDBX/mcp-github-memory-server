@@ -1,0 +1,25 @@
+---
+source: crates/testing/src/lib.rs
+assertion_line: 449
+expression: canonical
+---
+- id: mem_alpha_fixture
+  title: alpha
+  type: note
+  tags:
+    - a
+    - x
+    - "project:default"
+- id: mem_beta_fixture
+  title: beta
+  type: fact
+  tags:
+    - b
+    - "project:default"
+- id: mem_gamma_fixture
+  title: gamma
+  type: note
+  tags:
+    - a
+    - c
+    - "project:default"

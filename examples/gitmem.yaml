@@ -1,0 +1,30 @@
+default:
+  backend: github
+  root: ./repo
+
+serve:
+  backend: github
+  root: ./repo
+
+import:
+  backend: local
+  root: ./data
+
+sync:
+  backend: github
+  root: ./repo
+  remote: origin
+  branch: main
+  direction: both
+
+github:
+  commit_batch_ms: 1500
+  remote_name: sync
+  # Auto-push configuration: automatically push to remote after every write
+  auto_push: false
+  # remote_url: "https://github.com/user/repo.git"  # or file:///path/to/repo
+  credentials:
+    # mode: helper | userpass | token | ssh-agent
+    mode: helper
+    # username: x-access-token  # for token mode
+    # secret_env: GITHUB_TOKEN  # env var name for password/token

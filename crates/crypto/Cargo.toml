@@ -1,0 +1,13 @@
+[package]
+name = "mcp-gitmem-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Crypto facade (age-based) for GitMem"
+
+[dependencies]
+age = "0.10"
+secrecy = "0.8"
+thiserror = "1"
+base64 = "0.21"
+serde = { version = "1", features = ["derive"] }

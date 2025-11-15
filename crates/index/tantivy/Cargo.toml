@@ -1,0 +1,25 @@
+[package]
+name = "mcp-gitmem-index-tantivy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Tantivy-backed index implementation for GitMem"
+
+[dependencies]
+tantivy = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mcp-gitmem-core = { path = "../../core" }
+thiserror = "1"
+parking_lot = "0.12"
+tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+milli-core = "1.15.1"
+bumpalo = "3"
+arroy = "=0.6.1"
+
+[features]
+# When enabled, compile the real Tantivy-backed index. Default build keeps
+# an in-memory implementation suitable for fast iteration and portable builds.
+default = []
+real_tantivy = ["tantivy"]

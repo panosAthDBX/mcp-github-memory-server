@@ -1,0 +1,13 @@
+[package]
+name = "mcp-gitmem-storage-ephemeral"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "In-memory storage adapter for GitMem (tests and local runs)"
+
+[dependencies]
+mcp-gitmem-core = { path = "../../core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+parking_lot = "0.12"
+

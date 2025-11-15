@@ -1,0 +1,47 @@
+[package]
+name = "mcp-gitmem-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "MCP server runtime for GitMem (stdio and websocket)"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util"] }
+axum = { version = "0.8", features = ["ws"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+schemars = "0.8"
+mcp-gitmem-core = { path = "../core" }
+mcp-gitmem-proto = { path = "../proto" }
+mcp-gitmem-crypto = { path = "../crypto", optional = true }
+mcp-gitmem-storage-github = { path = "../storage/github", optional = true }
+mcp-gitmem-storage-local = { path = "../storage/local", optional = true }
+mcp-gitmem-storage-ephemeral = { path = "../storage/ephemeral", optional = true }
+mcp-gitmem-index-tantivy = { path = "../index/tantivy", optional = true }
+mcp-gitmem-compat = { path = "../compat" }
+secrecy = { version = "0.8", optional = true }
+rmcp = { version = "0.8.3", features = ["server", "transport-io", "transport-sse-server"] }
+tokio-util = { version = "0.7" }
+sha2 = "0.10"
+
+[dev-dependencies]
+mcp-gitmem-storage-ephemeral = { path = "../storage/ephemeral" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mcp-gitmem-index-tantivy = { path = "../index/tantivy" }
+tempfile = "3"
+age = "0.10"
+
+[features]
+encryption = ["mcp-gitmem-crypto", "secrecy"]
+index-tantivy = ["mcp-gitmem-index-tantivy"]
+real_tantivy = ["mcp-gitmem-index-tantivy/real_tantivy"]
+backend-github = ["mcp-gitmem-storage-github"]
+backend-local = ["mcp-gitmem-storage-local"]
+backend-ephemeral = ["mcp-gitmem-storage-ephemeral"]
+transport-stdio = []
+transport-ws = ["axum/ws"]
+remote-git = ["mcp-gitmem-storage-github/remote-git"]

@@ -1,0 +1,21 @@
+[package]
+name = "mcp-gitmem-testing"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[dev-dependencies]
+proptest = "1"
+insta = { version = "1", features = ["yaml"] }
+assert_cmd = "2"
+mcp-gitmem-core = { path = "../core" }
+mcp-gitmem-storage-ephemeral = { path = "../storage/ephemeral" }
+tempfile = "3"
+serde_json = "1"
+mcp-gitmem-proto = { path = "../proto" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "process"] }
+rmcp = { version = "0.8.3", features = ["client", "transport-child-process", "transport-io"] }
+
+[features]
+remote-git = []

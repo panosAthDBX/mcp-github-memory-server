@@ -1,0 +1,37 @@
+[package]
+name = "mcp-gitmem-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "gitmem command line for MCP GitHub Memory Server"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env", "cargo"] }
+config = { version = "0.15.18", features = ["toml", "yaml", "json"] }
+color-eyre = "0.6"
+indicatif = "0.18.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+mcp-gitmem-core = { path = "../core" }
+mcp-gitmem-server = { path = "../server", features = ["backend-github", "backend-local", "backend-ephemeral", "index-tantivy", "transport-stdio", "encryption"] }
+mcp-gitmem-storage-ephemeral = { path = "../storage/ephemeral" }
+mcp-gitmem-storage-local = { path = "../storage/local" }
+mcp-gitmem-index-tantivy = { path = "../index/tantivy" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+mcp-gitmem-compat = { path = "../compat" }
+mcp-gitmem-storage-github = { path = "../storage/github" }
+toml = "0.9"
+
+[[bin]]
+name = "gitmem"
+path = "src/main.rs"
+
+[features]
+default = []
+real_tantivy = ["mcp-gitmem-index-tantivy/real_tantivy"]
+encryption = ["mcp-gitmem-server/encryption"]
+remote-git = [
+    "mcp-gitmem-server/remote-git",
+    "mcp-gitmem-storage-github/remote-git"
+]
