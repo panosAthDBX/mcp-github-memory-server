@@ -22,6 +22,7 @@ regex = "1"
 url = "2"
 sha2 = "0.10"
 hex = "0.4"
+fs4 = "0.8"
 
 [features]
 remote-git = ["git2"]

@@ -22,6 +22,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
+use fs4::FileExt;
 
 #[derive(Debug, Error)]
 pub enum GithubError {
@@ -203,6 +204,7 @@ pub struct GithubStorage {
     device_branch: RwLock<String>,
     auto_push_enabled: RwLock<bool>,
     remote_url: RwLock<Option<String>>,
+    bulk_operation_in_progress: RwLock<bool>,
 }
 
 impl GithubStorage {
@@ -228,6 +230,7 @@ impl GithubStorage {
             device_branch: RwLock::new(Self::default_device_branch()),
             auto_push_enabled: RwLock::new(false),
             remote_url: RwLock::new(None),
+            bulk_operation_in_progress: RwLock::new(false),
         })
     }
 
@@ -280,11 +283,42 @@ impl GithubStorage {
         self.remote_url.read().clone()
     }
 
+    /// Acquire global push lock to coordinate between multiple gitmem instances.
+    /// Uses a file lock in /tmp to ensure FIFO ordering and prevent concurrent pushes.
+    fn acquire_push_lock() -> Result<File, GithubError> {
+        let lock_path = std::env::temp_dir().join("gitmem-push.lock");
+        
+        // Open or create the lock file
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| GithubError::Io(format!("failed to open push lock file: {}", e)))?;
+        
+        tracing::debug!("acquiring push lock");
+        
+        // Acquire exclusive lock (blocks until available, FIFO order)
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| GithubError::Io(format!("failed to acquire push lock: {}", e)))?;
+        
+        tracing::debug!("push lock acquired");
+        
+        Ok(lock_file)
+    }
+
     fn auto_push_if_enabled(&self) {
         if !self.is_auto_push_enabled() {
             return;
         }
-        
+
+        // Skip auto-push entirely during bulk operations (folder scans)
+        // The bulk operation will do a single push at the end
+        if *self.bulk_operation_in_progress.read() {
+            *self.dirty.write() = true;
+            return;
+        }
+
         let remote_url = match self.get_remote_url() {
             Some(url) => url,
             None => {
@@ -292,17 +326,37 @@ impl GithubStorage {
                 return;
             }
         };
-        
-        // Flush any pending commits first
+
+        // Rate limit: Skip if we pushed less than 5 seconds ago to avoid
+        // hundreds of push attempts during bulk imports
+        let last_push = *self.last_commit.read();
+        if let Some(last) = last_push {
+            if Instant::now().duration_since(last) < Duration::from_secs(5) {
+                tracing::trace!("skipping auto-push: too recent");
+                *self.dirty.write() = true; // Mark dirty so next push includes this change
+                return;
+            }
+        }
+
+        // Acquire lock ONLY for the flush + push sequence
+        let _lock_guard = match Self::acquire_push_lock() {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to acquire push lock, skipping auto-push");
+                return;
+            }
+        };
+
+        // Flush any pending commits while holding the lock
         if let Err(e) = self.flush() {
             tracing::error!(error = %e, "auto-push: flush failed");
             return;
         }
-        
-        // Push to remote
+
+        // Push to remote while holding the lock
         let span = tracing::info_span!("storage.github.auto_push", remote = %remote_url);
         let _guard = span.enter();
-        
+
         match self.push(&remote_url, None) {
             Ok(()) => {
                 tracing::debug!("auto-push succeeded");
@@ -311,6 +365,8 @@ impl GithubStorage {
                 tracing::error!(error = %e, remote = %remote_url, "auto-push failed");
             }
         }
+
+        // Lock is automatically released when _lock_guard is dropped
     }
 
     fn load_manifest(path: &Path) -> Result<Manifest, GithubError> {
@@ -634,12 +690,13 @@ impl GithubStorage {
         let now = Instant::now();
         let last = *self.last_commit.read();
         let batch = Duration::from_millis(self.commit_batch_ms);
-        if let Some(last) = last {
-            if now.duration_since(last) < batch {
-                *self.dirty.write() = true;
-                return Ok(());
-            }
+        
+        // Always defer commits when auto-push is enabled OR within batch window
+        if self.is_auto_push_enabled() || last.map_or(false, |l| now.duration_since(l) < batch) {
+            *self.dirty.write() = true;
+            return Ok(());
         }
+        
         // If dirty, squash into a batch commit
         if *self.dirty.read() {
             self.git_commit("chore(mem): batch changes")
@@ -1647,12 +1704,21 @@ impl GithubStorage {
         project: &ProjectId,
         filter_paths: Option<&[String]>,
     ) -> Result<Vec<RescanReport>, GithubError> {
+        // Acquire file lock at the START to protect entire scan+commit+push operation
+        // This prevents concurrent rescans from ANY gitmem process (poller, manual calls, other instances)
+        let _lock_guard = Self::acquire_push_lock().map_err(|e| {
+            GithubError::Io(format!("failed to acquire lock for rescan: {}", e))
+        })?;
+        
         let project = sanitize_project_id(project);
         self.ensure_project_dirs(&project)?;
         let mut registry = self.load_links(&project)?;
         if registry.entries.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Set bulk operation flag to disable auto-push during scan
+        *self.bulk_operation_in_progress.write() = true;
 
         let filter: Option<HashSet<PathBuf>> = filter_paths.map(|paths| {
             paths
@@ -1731,9 +1797,24 @@ impl GithubStorage {
         
         self.save_links(&project, &registry)?;
         
-        // Note: Commits for created/updated/deleted memories are already handled
-        // by the save(), update(), and delete() methods of the Storage trait.
-        // Auto-push is handled automatically by the storage layer if enabled.
+        // Do a single flush and push after processing all files
+        // Lock is already held for the entire rescan operation
+        if self.is_auto_push_enabled() {
+            if let Some(remote_url) = self.get_remote_url() {
+                // Flush any pending commits
+                if let Err(e) = self.flush() {
+                    tracing::error!(error = %e, "rescan: flush failed");
+                }
+                
+                // Push to remote
+                if let Err(e) = self.push(&remote_url, None) {
+                    tracing::error!(error = %e, remote = %remote_url, "rescan: push failed");
+                }
+            }
+        }
+        
+        // Clear bulk operation flag AFTER push completes
+        *self.bulk_operation_in_progress.write() = false;
         
         Ok(reports)
     }

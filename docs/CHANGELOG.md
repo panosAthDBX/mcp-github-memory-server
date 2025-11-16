@@ -88,3 +88,15 @@ This is the initial release, so no upgrade path exists yet.
 
 Check this section for breaking changes and upgrade instructions in future releases.
 
+
+
+## Test Update
+This is a test to verify auto-push works on folder sync.
+
+
+## Folder Monitoring Test
+Testing that auto-push works with GitHub backend folder monitoring - Sat Nov 15 16:22:06 GMT 2025
+
+
+## Lock Testing 2025-11-15 19:52:30
+Testing file-based locking for multi-instance coordination.

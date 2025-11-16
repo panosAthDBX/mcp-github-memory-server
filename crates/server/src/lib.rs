@@ -447,7 +447,6 @@ where
 
     pub async fn run_stdio(&self) -> Result<(), ServerError> {
         info!("server running (stdio rmcp)");
-        #[cfg(feature = "backend-local")]
         let poller = self.spawn_link_poller();
         let adapter = RmcpAdapter::new(self.clone());
         let service = adapter
@@ -462,7 +461,6 @@ where
         // Graceful shutdown: drain index queue and flush commits
         self.graceful_shutdown().await;
         
-        #[cfg(feature = "backend-local")]
         if let Some(token) = poller {
             token.cancel();
         }
@@ -490,7 +488,6 @@ where
             .await
             .map_err(|e| ServerError::Io(e.to_string()))?;
 
-        #[cfg(feature = "backend-local")]
         let poller = self.spawn_link_poller();
         let adapter = RmcpAdapter::new(self.clone());
         sse_server.with_service(move || adapter.clone());
@@ -519,7 +516,6 @@ where
         // Graceful shutdown: drain index queue and flush commits
         self.graceful_shutdown().await;
         
-        #[cfg(feature = "backend-local")]
         if let Some(token) = poller {
             token.cancel();
         }
@@ -3101,14 +3097,26 @@ where
         }
     }
 
-    #[cfg(feature = "backend-local")]
     fn spawn_link_poller(&self) -> Option<Arc<CancellationToken>> {
-        if (&*self.storage as &dyn Any)
+        // Check if storage supports folder linking (Local or GitHub)
+        #[cfg(feature = "backend-local")]
+        let has_local = (&*self.storage as &dyn Any)
             .downcast_ref::<LocalStorage>()
-            .is_none()
-        {
+            .is_some();
+        #[cfg(not(feature = "backend-local"))]
+        let has_local = false;
+        
+        #[cfg(feature = "backend-github")]
+        let has_github = (&*self.storage as &dyn Any)
+            .downcast_ref::<GithubStorage>()
+            .is_some();
+        #[cfg(not(feature = "backend-github"))]
+        let has_github = false;
+        
+        if !has_local && !has_github {
             return None;
         }
+        
         let storage_arc = Arc::clone(&self.storage);
         let token = Arc::new(CancellationToken::new());
         let poll_token = token.clone();
@@ -3120,16 +3128,34 @@ where
                     _ = poll_token.cancelled() => break,
                     _ = ticker.tick() => {
                         let storage_ref = &*storage_arc;
-                        let Some(local) = (storage_ref as &dyn Any).downcast_ref::<LocalStorage>() else {
-                            break;
+                        
+                        // Try to get links from either backend
+                        #[cfg(feature = "backend-local")]
+                        let links_result = if let Some(local) = (storage_ref as &dyn Any).downcast_ref::<LocalStorage>() {
+                            local.list_external_folders(None).ok()
+                        } else {
+                            None
                         };
-                        let Ok(links) = local.list_external_folders(None) else {
+                        #[cfg(not(feature = "backend-local"))]
+                        let links_result: Option<Vec<LinkedFolderInfo>> = None;
+                        
+                        #[cfg(feature = "backend-github")]
+                        let links_result = links_result.or_else(|| {
+                            if let Some(github) = (storage_ref as &dyn Any).downcast_ref::<GithubStorage>() {
+                                github.list_external_folders(None).ok()
+                            } else {
+                                None
+                            }
+                        });
+                        
+                        let Ok(links) = links_result.ok_or(()) else {
                             continue;
                         };
                         if links.is_empty() {
                             continue;
                         }
-                        let max_concurrent = local.max_concurrent().max(1);
+                        
+                        let max_concurrent = 4; // Default max concurrent scans
                         let now = Utc::now();
                         let mut due_links: Vec<(DateTime<Utc>, LinkedFolderInfo)> = Vec::new();
                         for link in links {
@@ -3156,10 +3182,21 @@ where
                             let link_id = link.link_id.clone();
                             let path = link.resolved_path.clone();
                             tokio::task::spawn_blocking(move || {
-                                if let Some(local) = (&*storage_clone as &dyn Any).downcast_ref::<LocalStorage>() {
-                                    let filters = vec![path];
+                                let storage_ref = &*storage_clone;
+                                let filters = vec![path.clone()];
+                                
+                                #[cfg(feature = "backend-local")]
+                                if let Some(local) = (storage_ref as &dyn Any).downcast_ref::<LocalStorage>() {
                                     if let Err(err) = local.rescan_external_folders(&project, Some(filters.as_slice())) {
-                                        warn!(project = %project, link = %link_id, error = %err, "linked folder poller rescan failed");
+                                        warn!(project = %project, link = %link_id, error = %err, "linked folder poller rescan failed (local)");
+                                    }
+                                    return;
+                                }
+                                
+                                #[cfg(feature = "backend-github")]
+                                if let Some(github) = (storage_ref as &dyn Any).downcast_ref::<GithubStorage>() {
+                                    if let Err(err) = github.rescan_external_folders(&project, Some(filters.as_slice())) {
+                                        warn!(project = %project, link = %link_id, error = %err, "linked folder poller rescan failed (github)");
                                     }
                                 }
                             });
@@ -3169,12 +3206,6 @@ where
             }
         });
         Some(token)
-    }
-
-    #[cfg(not(feature = "backend-local"))]
-    #[allow(dead_code)]
-    fn spawn_link_poller(&self) -> Option<Arc<CancellationToken>> {
-        None
     }
 
     async fn handle_import_basic(&self, req: JsonRpcRequest) -> JsonRpcResponse {
