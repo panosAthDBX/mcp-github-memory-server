@@ -295,7 +295,7 @@ impl GithubStorage {
             .open(&lock_path)
             .map_err(|e| GithubError::Io(format!("failed to open push lock file: {}", e)))?;
         
-        tracing::debug!("acquiring push lock");
+        tracing::debug!("acquiring push lock (blocking)");
         
         // Acquire exclusive lock (blocks until available, FIFO order)
         lock_file
@@ -303,6 +303,26 @@ impl GithubStorage {
             .map_err(|e| GithubError::Io(format!("failed to acquire push lock: {}", e)))?;
         
         tracing::debug!("push lock acquired");
+        
+        Ok(lock_file)
+    }
+    
+    fn try_acquire_push_lock() -> Result<File, GithubError> {
+        let lock_path = std::env::temp_dir().join("gitmem-push.lock");
+        
+        // Open or create the lock file
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| GithubError::Io(format!("failed to open push lock file: {}", e)))?;
+        
+        // Try to acquire exclusive lock (returns immediately if not available)
+        lock_file
+            .try_lock_exclusive()
+            .map_err(|e| GithubError::Io(format!("push lock not available: {}", e)))?;
+        
+        tracing::debug!("push lock acquired (non-blocking)");
         
         Ok(lock_file)
     }
@@ -338,11 +358,13 @@ impl GithubStorage {
             }
         }
 
-        // Acquire lock ONLY for the flush + push sequence
-        let _lock_guard = match Self::acquire_push_lock() {
+        // Try to acquire lock for flush + push, but don't block
+        // If a rescan is in progress, just mark dirty and skip
+        let _lock_guard = match Self::try_acquire_push_lock() {
             Ok(lock) => lock,
             Err(e) => {
-                tracing::error!(error = %e, "failed to acquire push lock, skipping auto-push");
+                tracing::trace!(error = %e, "could not acquire push lock, deferring auto-push");
+                *self.dirty.write() = true; // Mark dirty so next push includes this change
                 return;
             }
         };
@@ -1797,10 +1819,15 @@ impl GithubStorage {
         
         self.save_links(&project, &registry)?;
         
-        // Do a single flush and push after processing all files
-        // Lock is already held for the entire rescan operation
-        if self.is_auto_push_enabled() {
+        // Only flush and push if there were actual changes
+        let total_changes: usize = reports.iter()
+            .map(|r| r.created + r.updated + r.deleted)
+            .sum();
+        
+        if total_changes > 0 && self.is_auto_push_enabled() {
             if let Some(remote_url) = self.get_remote_url() {
+                tracing::debug!(changes = total_changes, "rescan: flushing and pushing changes");
+                
                 // Flush any pending commits
                 if let Err(e) = self.flush() {
                     tracing::error!(error = %e, "rescan: flush failed");
@@ -1811,6 +1838,8 @@ impl GithubStorage {
                     tracing::error!(error = %e, remote = %remote_url, "rescan: push failed");
                 }
             }
+        } else if total_changes == 0 {
+            tracing::trace!("rescan: no changes detected, skipping flush and push");
         }
         
         // Clear bulk operation flag AFTER push completes
