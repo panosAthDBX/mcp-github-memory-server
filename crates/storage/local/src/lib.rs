@@ -1106,7 +1106,31 @@ impl Storage for LocalStorage {
             .truncate(false)
             .open(self.lock_path(&project))
             .map_err(|e| LocalError::Io(e.to_string()))?;
-        fs4::FileExt::lock_exclusive(&lockf).map_err(|e| LocalError::Io(e.to_string()))?;
+        
+        // Try to acquire lock with timeout to prevent indefinite blocking
+        // when multiple Cursor instances are writing simultaneously
+        let max_attempts = 50;
+        let mut acquired = false;
+        for attempt in 0..max_attempts {
+            match fs4::FileExt::try_lock_exclusive(&lockf) {
+                Ok(_) => {
+                    acquired = true;
+                    break;
+                }
+                Err(_) => {
+                    if attempt < max_attempts - 1 {
+                        // Exponential backoff: 10ms, 20ms, 40ms, ..., max 500ms
+                        let delay_ms = std::cmp::min(10 * (1 << attempt), 500);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                }
+            }
+        }
+        if !acquired {
+            return Err(LocalError::Io(
+                "failed to acquire lock after timeout (another process may be writing)".to_string()
+            ));
+        }
         let res = (|| {
             let rel = self.path_for_memory(&project, memory);
             self.ensure_parent(&project, &rel)?;
@@ -1207,7 +1231,29 @@ impl Storage for LocalStorage {
             .truncate(false)
             .open(self.lock_path(&project))
             .map_err(|e| LocalError::Io(e.to_string()))?;
-        fs4::FileExt::lock_exclusive(&lockf).map_err(|e| LocalError::Io(e.to_string()))?;
+        
+        // Try to acquire lock with timeout to prevent indefinite blocking
+        let max_attempts = 50;
+        let mut acquired = false;
+        for attempt in 0..max_attempts {
+            match fs4::FileExt::try_lock_exclusive(&lockf) {
+                Ok(_) => {
+                    acquired = true;
+                    break;
+                }
+                Err(_) => {
+                    if attempt < max_attempts - 1 {
+                        let delay_ms = std::cmp::min(10 * (1 << attempt), 500);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                }
+            }
+        }
+        if !acquired {
+            return Err(LocalError::Io(
+                "failed to acquire lock after timeout (another process may be deleting)".to_string()
+            ));
+        }
         let res = (|| {
             let (rel, snapshot) = {
                 let mut manifests = self.manifests.write();

@@ -167,6 +167,8 @@ pub struct Server<S, I> {
     encryption: Option<EncryptionConfig>,
     index_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<IndexUpdate>>,
     index_worker_cancel: Option<Arc<CancellationToken>>,
+    /// Semaphore to limit concurrent write operations and prevent thread pool exhaustion
+    write_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<S, I> Clone for Server<S, I> {
@@ -179,6 +181,7 @@ impl<S, I> Clone for Server<S, I> {
             encryption: self.encryption.clone(),
             index_queue_tx: self.index_queue_tx.clone(),
             index_worker_cancel: self.index_worker_cancel.clone(),
+            write_semaphore: Arc::clone(&self.write_semaphore),
         }
     }
 }
@@ -268,6 +271,8 @@ where
             encryption,
             index_queue_tx: Some(index_queue_tx),
             index_worker_cancel: Some(index_worker_cancel),
+            // Limit to 4 concurrent writes to prevent thread pool exhaustion
+            write_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -736,6 +741,15 @@ where
         };
         #[cfg(not(feature = "encryption"))]
         let index_doc = mem.clone();
+        // Acquire semaphore permit to limit concurrent writes
+        let _permit = match self.write_semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!("semaphore closed");
+                return mcp_error_response(id, "E_STORAGE_IO", "write semaphore closed");
+            }
+        };
+        
         let storage = Arc::clone(&self.storage);
         let project_for_save = project.clone();
         let mem_for_save = mem.clone();
@@ -750,6 +764,7 @@ where
             error!(error=%e, "storage.save failed");
             return mcp_error_response(id, "E_STORAGE_IO", &e.to_string());
         }
+        // Permit is dropped here, releasing the semaphore
         // Queue index update asynchronously
         self.queue_index_update(project.clone(), index_doc);
         debug!(memory_id = %mem.id, project = %project, "memory saved, index update queued");
@@ -805,6 +820,16 @@ where
         let idc = params.id.clone();
         let project = self.resolve_project_param(params.project.as_deref());
         debug!(memory_id = %idc, project = %project, hard, "deleting memory");
+        
+        // Acquire semaphore permit to limit concurrent writes
+        let _permit = match self.write_semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!("semaphore closed");
+                return mcp_error_response(idv, "E_STORAGE_IO", "write semaphore closed");
+            }
+        };
+        
         let idx_id = idc.clone();
         let storage = Arc::clone(&self.storage);
         let project_for_delete = project.clone();
@@ -946,6 +971,15 @@ where
         };
         #[cfg(not(feature = "encryption"))]
         let index_doc = mem.clone();
+
+        // Acquire semaphore permit to limit concurrent writes
+        let _permit = match self.write_semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!("semaphore closed");
+                return mcp_error_response(idv, "E_STORAGE_IO", "write semaphore closed");
+            }
+        };
 
         // Persist and reindex
         let storage = Arc::clone(&self.storage);
@@ -3792,7 +3826,42 @@ fn push_tool_definition(
 }
 
 fn root_schema_to_value(schema: RootSchema) -> Result<serde_json::Value, ServerError> {
-    serde_json::to_value(schema).map_err(|e| ServerError::Parse(e.to_string()))
+    let mut schema_value = serde_json::to_value(schema).map_err(|e| ServerError::Parse(e.to_string()))?;
+    fix_nullable_types(&mut schema_value);
+    Ok(schema_value)
+}
+
+fn fix_nullable_types(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Check if this is a property with type: ["string", "null"] or similar
+            if let Some(type_value) = map.get_mut("type") {
+                if let Some(type_array) = type_value.as_array() {
+                    // If it's an array with "null" and one other type, simplify it
+                    if type_array.len() == 2 {
+                        let has_null = type_array.iter().any(|v| v.as_str() == Some("null"));
+                        let other_type = type_array.iter().find(|v| v.as_str() != Some("null"));
+                        
+                        if has_null && other_type.is_some() {
+                            // Replace the array with just the non-null type
+                            *type_value = other_type.unwrap().clone();
+                        }
+                    }
+                }
+            }
+            
+            // Recursively process all nested objects
+            for (_, v) in map.iter_mut() {
+                fix_nullable_types(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                fix_nullable_types(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 struct RmcpAdapter<S, I> {
@@ -4089,6 +4158,45 @@ mod tests {
                 total: 0,
             })
         }
+    }
+
+    #[test]
+    fn test_fix_nullable_types() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": ["string", "null"],
+                    "default": null
+                },
+                "content": {
+                    "type": "string"
+                },
+                "count": {
+                    "type": ["integer", "null"]
+                }
+            }
+        });
+        
+        fix_nullable_types(&mut schema);
+        
+        // Check that ["string", "null"] was simplified to "string"
+        assert_eq!(
+            schema["properties"]["title"]["type"],
+            json!("string")
+        );
+        
+        // Check that plain "string" is unchanged
+        assert_eq!(
+            schema["properties"]["content"]["type"],
+            json!("string")
+        );
+        
+        // Check that ["integer", "null"] was simplified to "integer"
+        assert_eq!(
+            schema["properties"]["count"]["type"],
+            json!("integer")
+        );
     }
 
     #[test]

@@ -123,13 +123,16 @@ pub struct ClientInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SaveParams {
+    #[serde(default)]
     pub title: Option<String>,
     pub content: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub r#type: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
     pub ttl: Option<String>,
+    #[serde(default)]
     pub score: Option<f32>,
     #[serde(default)]
     pub project: Option<String>,
