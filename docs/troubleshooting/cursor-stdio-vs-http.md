@@ -1,3 +1,9 @@
+---
+title: Cursor MCP Transport - Stdio vs HTTP
+tags: [cursor, stdio, http, troubleshooting, mcp-transport]
+type: doc
+---
+
 # Cursor MCP Transport: Stdio vs HTTP
 
 ## Issue

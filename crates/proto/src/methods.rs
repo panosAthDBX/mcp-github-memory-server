@@ -128,7 +128,7 @@ pub struct SaveParams {
     #[serde(rename = "type")]
     pub r#type: Option<String>,
     #[serde(default)]
-    pub tags: Option<Vec<String>>,
+    pub tags: Vec<String>,
     pub ttl: Option<String>,
     pub score: Option<f32>,
     #[serde(default)]
@@ -724,12 +724,13 @@ pub struct WriteNoteParams {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
-    pub tags: Option<Vec<String>>,
+    pub tags: Vec<String>,
     #[serde(default)]
     pub note_type: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadNoteParams {
@@ -746,7 +747,7 @@ pub struct EditNoteParams {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
-    pub tags: Option<Vec<String>>,
+    pub tags: Vec<String>,
     #[serde(default)]
     pub note_type: Option<String>,
     #[serde(default)]
@@ -776,7 +777,7 @@ pub struct SearchNotesParams {
     #[serde(default)]
     pub query: Option<String>,
     #[serde(default)]
-    pub tags: Option<Vec<String>>,
+    pub tags: Vec<String>,
     #[serde(default)]
     pub note_types: Option<Vec<String>>,
     #[serde(default)]
@@ -1181,5 +1182,29 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(filter_tag, "b");
+    }
+    
+    #[test]
+    fn write_note_params_tags_schema_inspection() {
+        let schema = schemars::schema_for!(WriteNoteParams);
+        println!("\nFull WriteNoteParams schema:");
+        println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+        
+        let object_validation = schema
+            .schema
+            .object
+            .as_ref()
+            .expect("expected object validation for WriteNoteParams");
+        
+        if let Some(tags_schema) = object_validation.properties.get("tags") {
+            println!("\nTags property schema:");
+            println!("{}", serde_json::to_string_pretty(tags_schema).unwrap());
+            
+            if let Schema::Object(tags_obj) = tags_schema {
+                println!("\nTags instance_type: {:?}", tags_obj.instance_type);
+            }
+        } else {
+            panic!("tags property not found in schema");
+        }
     }
 }

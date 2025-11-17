@@ -1,3 +1,9 @@
+---
+title: GitMem Daemon Setup (WebSocket/HTTP Mode)
+tags: [daemon, websocket, http, setup, configuration, launchd]
+type: doc
+---
+
 # GitMem Daemon Setup (WebSocket/HTTP Mode)
 
 ## ⚠️ Important Note

@@ -721,8 +721,8 @@ where
         };
         let title = params.title.unwrap_or_default();
         let mut mem = Memory::new(&title, &params.content, &r#type);
-        if let Some(tags) = params.tags {
-            mem.tags = tags;
+        if !params.tags.is_empty() {
+            mem.tags = params.tags;
         }
         mem.score = params.score;
         mem.ttl = params.ttl;
@@ -883,11 +883,19 @@ where
                 content_changed = true;
             }
         }
-        if let Some(v) = params.patch.get("tags").and_then(|v| v.as_array()) {
-            mem.tags = v
-                .iter()
-                .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                .collect();
+        if let Some(v) = params.patch.get("tags") {
+            tracing::debug!(tags_value = ?v, "found tags in patch");
+            if let Some(arr) = v.as_array() {
+                mem.tags = arr
+                    .iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect();
+                tracing::debug!(new_tags = ?mem.tags, "applied tags from patch");
+            } else {
+                tracing::warn!(tags_value = ?v, "tags in patch but not an array");
+            }
+        } else {
+            tracing::debug!("no tags found in patch");
         }
         if let Some(v) = params.patch.get("type").and_then(|v| v.as_str()) {
             match normalize_type(Some(v)) {
@@ -1222,8 +1230,8 @@ where
         if let Some(content) = params.content {
             patch.insert("content".into(), json!(content));
         }
-        if let Some(tags) = params.tags {
-            patch.insert("tags".into(), json!(tags));
+        if !params.tags.is_empty() {
+            patch.insert("tags".into(), json!(params.tags));
         }
         if let Some(note_type) = params.note_type {
             patch.insert("type".into(), json!(note_type));
@@ -1355,8 +1363,8 @@ where
             Err(e) => return invalid_params(idv, e),
         };
         let mut filters = serde_json::Map::new();
-        if let Some(tags) = params.tags.clone() {
-            filters.insert("tags".into(), json!(tags));
+        if !params.tags.is_empty() {
+            filters.insert("tags".into(), json!(params.tags));
         }
         if let Some(types) = params.note_types.clone() {
             filters.insert("type".into(), json!(types));

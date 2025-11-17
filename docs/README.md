@@ -1,3 +1,9 @@
+---
+title: MCP GitHub Memory Server Documentation
+tags: [documentation, index, overview, getting-started]
+type: doc
+---
+
 # MCP GitHub Memory Server - Documentation
 
 Welcome to the documentation for the MCP GitHub Memory Server!

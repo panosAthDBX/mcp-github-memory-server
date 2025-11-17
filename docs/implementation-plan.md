@@ -1,4 +1,10 @@
-# Implementation Plan – MCP GitHub Memory Server vs Basic Memory OSS
+---
+title: Implementation Plan — MCP GitHub Memory Server
+tags: [implementation, planning, roadmap, architecture]
+type: doc
+---
+
+# Implementation Plan — MCP GitHub Memory Server vs Basic Memory OSS
 
 ## Phase 0 – Groundwork
 - Audit existing crates to map current behaviour to the updated spec (storage project handling, CLI args, compatibility handlers, missing tools).

@@ -1,3 +1,9 @@
+---
+title: Integrating GitMem (MCP) via stdio
+tags: [stdio, integration, cursor, configuration, mcp-transport]
+type: doc
+---
+
 # Integrating GitMem (MCP) via stdio
 
 This guide shows how to run the GitMem server in stdio mode and wire it into stdio‑aware MCP clients such as Cursor and Codex CLI.

@@ -1,3 +1,9 @@
+---
+title: External Folder Linking with GitHub Backend
+tags: [folder-linking, github-backend, implementation, feature, monitoring]
+type: doc
+---
+
 # External Folder Linking with GitHub Backend
 
 ## Status: ✅ FULLY IMPLEMENTED

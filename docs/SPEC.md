@@ -1,3 +1,9 @@
+---
+title: MCP GitHub Memory Server — Technical Specification
+tags: [specification, technical, architecture, storage, indexing, encryption]
+type: doc
+---
+
 # MCP GitHub Memory Server — Technical Specification (Rust)
 
 ## TL;DR
