@@ -822,9 +822,36 @@ impl LocalStorage {
         let include_patterns = Self::compile_patterns(entry.include.as_ref())?;
         let exclude_patterns = Self::compile_patterns(entry.exclude.as_ref())?;
 
+        const SKIP_DIRS: &[&str] = &[
+            "target",
+            "node_modules",
+            ".git",
+            ".cache",
+            ".next",
+            "dist",
+            "build",
+            ".turbo",
+            ".venv",
+            "venv",
+            ".direnv",
+        ];
+
         let mut new_mappings = HashMap::new();
         let mut visited_files = HashSet::new();
-        for walk_entry in WalkDir::new(&dir_path).into_iter().filter_map(Result::ok) {
+        for walk_entry in WalkDir::new(&dir_path)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.file_type().is_dir() {
+                    if let Some(name) = e.file_name().to_str() {
+                        if SKIP_DIRS.contains(&name) || name.starts_with('.') {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .filter_map(Result::ok)
+        {
             if walk_entry.file_type().is_dir() {
                 continue;
             }
@@ -1106,7 +1133,7 @@ impl Storage for LocalStorage {
             .truncate(false)
             .open(self.lock_path(&project))
             .map_err(|e| LocalError::Io(e.to_string()))?;
-        
+
         // Try to acquire lock with timeout to prevent indefinite blocking
         // when multiple Cursor instances are writing simultaneously
         let max_attempts = 50;
@@ -1128,7 +1155,7 @@ impl Storage for LocalStorage {
         }
         if !acquired {
             return Err(LocalError::Io(
-                "failed to acquire lock after timeout (another process may be writing)".to_string()
+                "failed to acquire lock after timeout (another process may be writing)".to_string(),
             ));
         }
         let res = (|| {
@@ -1231,7 +1258,7 @@ impl Storage for LocalStorage {
             .truncate(false)
             .open(self.lock_path(&project))
             .map_err(|e| LocalError::Io(e.to_string()))?;
-        
+
         // Try to acquire lock with timeout to prevent indefinite blocking
         let max_attempts = 50;
         let mut acquired = false;
@@ -1251,7 +1278,8 @@ impl Storage for LocalStorage {
         }
         if !acquired {
             return Err(LocalError::Io(
-                "failed to acquire lock after timeout (another process may be deleting)".to_string()
+                "failed to acquire lock after timeout (another process may be deleting)"
+                    .to_string(),
             ));
         }
         let res = (|| {

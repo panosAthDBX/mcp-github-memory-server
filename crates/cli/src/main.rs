@@ -48,6 +48,9 @@ struct ServeArgs {
     backend: Backend,
     #[arg(long, default_value = "./data")]
     root: String,
+    /// Compatibility flag: stdio is the default transport; this is accepted to match older MCP configs.
+    #[arg(long, hide = true, default_value_t = false)]
+    stdio: bool,
     #[arg(long)]
     project: Option<String>,
     #[arg(long, default_value_t = false)]
@@ -356,7 +359,9 @@ async fn serve(mut args: ServeArgs, cfg: Option<&AppConfig>) -> Result<()> {
                             storage.enable_auto_push(url);
                             tracing::info!("auto-push enabled from config");
                         } else {
-                            tracing::warn!("auto-push enabled in config but no remote_url specified");
+                            tracing::warn!(
+                                "auto-push enabled in config but no remote_url specified"
+                            );
                         }
                     }
                 }

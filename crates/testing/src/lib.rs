@@ -174,6 +174,8 @@ mod cli_tests {
 mod conformance {
     use assert_cmd::cargo::cargo_bin;
     use insta::assert_yaml_snapshot;
+    // kept for clarity in remote-git tests when the feature is enabled
+    // (no-op when feature is off)
     use mcp_gitmem_proto as proto;
     use rmcp::{
         model::{CallToolRequestParam, CallToolResult, ClientInfo},
@@ -258,6 +260,98 @@ mod conformance {
         serve_client(client_info, transport)
             .await
             .expect("rmcp initialize")
+    }
+
+    #[allow(dead_code)]
+    async fn stop_service(service: RunningService<RoleClient, ClientInfo>) {
+        // Best-effort shutdown; cancel() returns QuitReason
+        let _ = service.cancel().await;
+    }
+
+    // Exercise two stdio servers (same repo) writing concurrently to surface
+    // cross-process manifest/lock bugs (matches Cursor multi-window usage).
+    #[cfg(feature = "remote-git")]
+    #[test]
+    fn github_multi_stdio_instances_share_writes() {
+        runtime().block_on(async {
+            ensure_gitmem_remote_git_built();
+
+            let tmp = tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            fs::create_dir_all(&repo_root).unwrap();
+
+            // Start two servers pointing at the same repo
+            let svc_a = spawn_github_service(&repo_root, &[]).await;
+            let svc_b = spawn_github_service(&repo_root, &[]).await;
+
+            let peer_a = svc_a.peer().clone();
+            let peer_b = svc_b.peer().clone();
+            let save_name = proto::exported_tool_name(proto::TOOL_MEMORY_SAVE);
+
+            // Write note from server A
+            let a_id = {
+                let payload = call_tool_json(
+                    &peer_a,
+                    &save_name,
+                    json!({
+                        "title": "from A",
+                        "content": "note A",
+                        "type": "note"
+                    }),
+                )
+                .await;
+                payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            };
+
+            // Write note from server B
+            let b_id = {
+                let payload = call_tool_json(
+                    &peer_b,
+                    &save_name,
+                    json!({
+                        "title": "from B",
+                        "content": "note B",
+                        "type": "note"
+                    }),
+                )
+                .await;
+                payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            };
+
+            // Read via a fresh server C to ensure both writes are visible
+            let svc_c = spawn_github_service(&repo_root, &[]).await;
+            let peer_c = svc_c.peer().clone();
+            let get_name = proto::exported_tool_name(proto::TOOL_MEMORY_GET);
+
+            let got_a = call_tool_json(
+                &peer_c,
+                &get_name,
+                json!({"id": a_id, "project": DEFAULT_PROJECT_ID}),
+            )
+            .await;
+            let got_b = call_tool_json(
+                &peer_c,
+                &get_name,
+                json!({"id": b_id, "project": DEFAULT_PROJECT_ID}),
+            )
+            .await;
+
+            assert_eq!(got_a.get("title").and_then(Value::as_str), Some("from A"));
+            assert_eq!(got_b.get("title").and_then(Value::as_str), Some("from B"));
+
+            // Cleanly stop services
+            stop_service(svc_a).await;
+            stop_service(svc_b).await;
+            stop_service(svc_c).await;
+        });
     }
 
     #[cfg(feature = "remote-git")]

@@ -13,6 +13,8 @@ use mcp_gitmem_core::{
 #[cfg(feature = "encryption")]
 use mcp_gitmem_crypto::{CryptoConfig, CryptoError, CryptoFacade};
 use mcp_gitmem_proto as proto;
+#[cfg(feature = "backend-github")]
+use mcp_gitmem_storage_github::GithubError;
 use rmcp::{
     model::{
         CallToolRequestParam, CallToolResult, ErrorCode, Implementation, ListResourcesResult,
@@ -41,8 +43,9 @@ use std::net::SocketAddr;
 use std::sync::Arc as StdArc;
 use std::sync::Arc;
 use thiserror::Error;
-#[cfg(feature = "backend-local")]
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::Duration;
+#[cfg(any(feature = "backend-local", feature = "backend-github"))]
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "backend-local")]
 use tracing::warn;
@@ -53,7 +56,16 @@ use mcp_gitmem_storage_ephemeral::EphemeralStorage;
 #[cfg(feature = "backend-github")]
 use mcp_gitmem_storage_github::GithubStorage;
 #[cfg(feature = "backend-local")]
-use mcp_gitmem_storage_local::{LinkWatchSettings, LinkedFolderInfo, LocalStorage};
+use mcp_gitmem_storage_local::LocalStorage;
+#[cfg(any(feature = "backend-local", feature = "backend-github"))]
+use mcp_gitmem_storage_local::{LinkWatchSettings, LinkedFolderInfo};
+
+/// Default timeout for blocking storage/index operations wrapped with `spawn_blocking`.
+/// A shorter timeout is used in tests to keep them fast.
+#[cfg(not(test))]
+const BLOCKING_OP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const BLOCKING_OP_TIMEOUT: Duration = Duration::from_millis(200);
 
 fn memory_to_json(memory: &Memory) -> serde_json::Value {
     serde_json::to_value(memory).unwrap_or_else(|_| json!({}))
@@ -147,7 +159,7 @@ struct JsonRpcResponse {
 }
 
 /// Message type for async index update queue
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum IndexUpdate {
     Update {
         project: ProjectId,
@@ -157,6 +169,8 @@ enum IndexUpdate {
         project: ProjectId,
         id: String,
     },
+    #[cfg(test)]
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 pub struct Server<S, I> {
@@ -167,6 +181,7 @@ pub struct Server<S, I> {
     encryption: Option<EncryptionConfig>,
     index_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<IndexUpdate>>,
     index_worker_cancel: Option<Arc<CancellationToken>>,
+    sync_worker_cancel: Option<Arc<CancellationToken>>, // Background sync thread cancellation
     /// Semaphore to limit concurrent write operations and prevent thread pool exhaustion
     write_semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -181,6 +196,7 @@ impl<S, I> Clone for Server<S, I> {
             encryption: self.encryption.clone(),
             index_queue_tx: self.index_queue_tx.clone(),
             index_worker_cancel: self.index_worker_cancel.clone(),
+            sync_worker_cancel: self.sync_worker_cancel.clone(),
             write_semaphore: Arc::clone(&self.write_semaphore),
         }
     }
@@ -226,7 +242,7 @@ impl Default for ServerOptions {
 
 impl<S, I> Server<S, I>
 where
-    S: Storage + Send + Sync + 'static,
+    S: Storage + Send + Sync + 'static + Any,
     I: Index + Send + Sync + 'static,
 {
     #[must_use]
@@ -253,24 +269,31 @@ where
                 .filter(|s| !s.is_empty())
                 .collect(),
         );
-        
+
         // Create unbounded channel for async index updates
         let (index_queue_tx, index_queue_rx) = tokio::sync::mpsc::unbounded_channel();
         let index_worker_cancel = Arc::new(CancellationToken::new());
-        
+
         // Spawn background worker for index updates
         let index_arc = Arc::new(index);
         let cancel_token = index_worker_cancel.clone();
         Self::spawn_index_worker(index_arc.clone(), index_queue_rx, cancel_token);
-        
+
+        // Spawn background worker for git sync (if GithubStorage)
+        let storage_arc = Arc::new(storage);
+        let sync_worker_cancel = Arc::new(CancellationToken::new());
+        let sync_cancel_token = sync_worker_cancel.clone();
+        Self::spawn_sync_worker(storage_arc.clone(), sync_cancel_token);
+
         Self {
-            storage: Arc::new(storage),
+            storage: storage_arc,
             index: index_arc,
             default_project,
             #[cfg(feature = "encryption")]
             encryption,
             index_queue_tx: Some(index_queue_tx),
             index_worker_cancel: Some(index_worker_cancel),
+            sync_worker_cancel: Some(sync_worker_cancel),
             // Limit to 4 concurrent writes to prevent thread pool exhaustion
             write_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         }
@@ -282,54 +305,185 @@ where
         cancel: Arc<CancellationToken>,
     ) {
         tokio::spawn(async move {
-            let mut queue_size = 0usize;
+            use std::collections::HashMap;
+            let mut batches: HashMap<ProjectId, Vec<Memory>> = HashMap::new();
+            const MAX_BATCH_SIZE: usize = 2000;
+
+            // Helper to flush a specific batch
+            async fn flush_batch<I: Index + Send + Sync + 'static>(
+                index: &Arc<I>,
+                project: &ProjectId,
+                batch: &[Memory],
+            ) {
+                if batch.is_empty() {
+                    return;
+                }
+                let index_clone = index.clone();
+                let project_clone = project.clone();
+                let memories_clone = batch.to_vec();
+
+                let log_project = project.clone();
+                let log_count = memories_clone.len();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    index_clone.update_batch(&project_clone, &memories_clone)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        tracing::debug!(count = %log_count, project = %log_project, "index batch updated");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, count = %log_count, project = %log_project, "index batch update failed");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "index batch update task panicked");
+                    }
+                }
+            }
+
+            enum WorkerAction {
+                Delete(ProjectId, String),
+                #[cfg(test)]
+                Flush(tokio::sync::oneshot::Sender<()>),
+            }
+
+            // Helper to process a single update
+            fn process_update(
+                update: IndexUpdate,
+                batches: &mut HashMap<ProjectId, Vec<Memory>>,
+            ) -> Option<WorkerAction> {
+                match update {
+                    IndexUpdate::Update { project, memory } => {
+                        let batch = batches
+                            .entry(project)
+                            .or_insert_with(|| Vec::with_capacity(MAX_BATCH_SIZE));
+                        batch.push(memory);
+                        None
+                    }
+                    IndexUpdate::Delete { project, id } => Some(WorkerAction::Delete(project, id)),
+                    #[cfg(test)]
+                    IndexUpdate::Flush(done) => Some(WorkerAction::Flush(done)),
+                }
+            }
+
             loop {
+                // Determine if we need a timeout (if any batch has items)
+                let has_pending = !batches.is_empty();
+                let timeout_duration = if has_pending {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(3600)
+                };
+
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         tracing::info!("index worker received cancellation signal");
                         break;
                     }
+                    _ = tokio::time::sleep(timeout_duration), if has_pending => {
+                        // Flush all batches
+                        for (project, batch) in batches.drain() {
+                            flush_batch(&index, &project, &batch).await;
+                        }
+                    }
                     update = rx.recv() => {
                         match update {
-                            Some(IndexUpdate::Update { project, memory }) => {
-                                queue_size = queue_size.saturating_sub(1);
-                                let index_clone = index.clone();
-                                let project_clone = project.clone();
-                                let memory_clone = memory.clone();
-                                let result = tokio::task::spawn_blocking(move || {
-                                    index_clone.update(&project_clone, &memory_clone)
-                                }).await;
-                                
-                                match result {
-                                    Ok(Ok(())) => {
-                                        tracing::debug!(memory_id = %memory.id, project = %project, "index updated");
-                                    }
-                                    Ok(Err(e)) => {
-                                        tracing::error!(error = %e, memory_id = %memory.id, project = %project, "index update failed");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "index update task panicked");
+                            Some(mut update) => {
+                                // Process the first update
+                                let mut actions = Vec::new();
+                                if let Some(action) = process_update(update, &mut batches) {
+                                    actions.push(action);
+                                }
+
+                                // Aggressively drain channel up to limit to form larger batches
+                                // This is crucial for performance during bulk imports
+                                let mut count = 0;
+                                while count < MAX_BATCH_SIZE {
+                                    match rx.try_recv() {
+                                        Ok(u) => {
+                                            if let Some(action) = process_update(u, &mut batches) {
+                                                actions.push(action);
+                                            }
+                                            count += 1;
+                                        }
+                                        Err(_) => break,
                                     }
                                 }
-                            }
-                            Some(IndexUpdate::Delete { project, id }) => {
-                                queue_size = queue_size.saturating_sub(1);
-                                let index_clone = index.clone();
-                                let project_clone = project.clone();
-                                let id_clone = id.clone();
-                                let result = tokio::task::spawn_blocking(move || {
-                                    index_clone.delete(&project_clone, &id_clone)
-                                }).await;
-                                
-                                match result {
-                                    Ok(Ok(())) => {
-                                        tracing::debug!(memory_id = %id, project = %project, "index deleted");
+
+                                // Flush batches that reached size limit
+                                let mut flushed_projects = Vec::new();
+                                for (project, batch) in batches.iter() {
+                                    if batch.len() >= MAX_BATCH_SIZE {
+                                        flushed_projects.push(project.clone());
                                     }
-                                    Ok(Err(e)) => {
-                                        tracing::error!(error = %e, memory_id = %id, project = %project, "index delete failed");
+                                }
+                                for project in flushed_projects {
+                                    if let Some(batch) = batches.remove(&project) {
+                                        flush_batch(&index, &project, &batch).await;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "index delete task panicked");
+                                }
+
+                                // Separate deletes and flushes
+                                let mut pending_deletes = Vec::new();
+                                #[cfg(test)]
+                                let mut pending_flushes = Vec::new();
+
+                                for action in actions {
+                                    match action {
+                                        WorkerAction::Delete(project, id) => pending_deletes.push((project, id)),
+                                        #[cfg(test)]
+                                        WorkerAction::Flush(done) => pending_flushes.push(done),
+                                    }
+                                }
+
+                                // Handle deletes immediately (after flushing relevant project batch if needed)
+                                // Group deletes by project
+                                let mut deletes_by_project: HashMap<ProjectId, Vec<String>> = HashMap::new();
+                                for (project, id) in pending_deletes {
+                                    deletes_by_project.entry(project).or_default().push(id);
+                                }
+
+                                for (project, ids) in deletes_by_project {
+                                    // Flush pending updates for this project first to maintain order
+                                    if let Some(batch) = batches.remove(&project) {
+                                        flush_batch(&index, &project, &batch).await;
+                                    }
+
+                                    let index_clone = index.clone();
+                                    let project_clone = project.clone();
+                                    let ids_clone = ids.clone();
+                                    let count = ids_clone.len();
+
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        index_clone.delete_batch(&project_clone, &ids_clone)
+                                    }).await;
+
+                                    match result {
+                                        Ok(Ok(())) => {
+                                            tracing::debug!(count = %count, project = %project, "index batch deleted");
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::error!(error = %e, count = %count, project = %project, "index batch delete failed");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "index batch delete task panicked");
+                                        }
+                                    }
+                                }
+
+                                // Handle flushes (only in tests)
+                                #[cfg(test)]
+                                {
+                                    if !pending_flushes.is_empty() {
+                                        // Flush ALL remaining batches before signaling
+                                        for (project, batch) in batches.drain() {
+                                            flush_batch(&index, &project, &batch).await;
+                                        }
+                                        for done in pending_flushes {
+                                            let _ = done.send(());
+                                        }
                                     }
                                 }
                             }
@@ -338,17 +492,89 @@ where
                                 break;
                             }
                         }
-                        
-                        // Log warning if queue is getting large
-                        if queue_size > 5000 {
-                            tracing::warn!(queue_size, "index queue is growing large");
+                    }
+                }
+            }
+
+            // Final flush on exit
+            for (project, batch) in batches.drain() {
+                flush_batch(&index, &project, &batch).await;
+            }
+        });
+    }
+
+    fn spawn_sync_worker(storage: Arc<S>, cancel: Arc<CancellationToken>) {
+        // Only spawn worker if using GithubStorage
+        #[cfg(feature = "backend-github")]
+        {
+            use tokio::time::{interval, Duration};
+
+            // Erase the concrete storage type so we can safely downcast the Arc
+            let storage_any: Arc<dyn Any + Send + Sync> = storage;
+
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(10)); // Check every 10 seconds
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                tracing::info!(
+                    "background sync worker started, checking for dirty projects every 10 seconds"
+                );
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("sync worker received cancellation signal");
+                            break;
+                        }
+                        _ = ticker.tick() => {
+                            // Try to downcast storage to GithubStorage
+                            if let Ok(github_storage) = storage_any.clone().downcast::<GithubStorage>() {
+                                if github_storage.has_dirty_projects() {
+                                    let dirty = github_storage.take_dirty_projects();
+                                    let count = dirty.len();
+                                    tracing::debug!(count = count, "found dirty projects, syncing");
+
+                                    for project in dirty {
+                                        let gh = github_storage.clone();
+                                        let proj_clone = project.clone();
+                                        // Offload blocking git work to a dedicated thread with a timeout
+                                        let sync_res = tokio::task::spawn_blocking(move || gh.sync_project(&proj_clone));
+                                        match tokio::time::timeout(Duration::from_secs(15), sync_res).await {
+                                            Ok(Ok(Ok(()))) => {
+                                                tracing::info!(project = %project, "successfully synced project");
+                                            }
+                                            Ok(Ok(Err(e))) => {
+                                                let error_msg = e.to_string();
+                                                if error_msg.contains("lock busy") {
+                                                    tracing::debug!(project = %project, "sync lock busy, will retry later");
+                                                } else {
+                                                    tracing::error!(project = %project, error = %e, "failed to sync project");
+                                                }
+                                                github_storage.mark_project_dirty(project);
+                                            }
+                                            Ok(Err(join_err)) => {
+                                                tracing::error!(project = %project, error = %join_err, "sync worker join error");
+                                                github_storage.mark_project_dirty(project);
+                                            }
+                                            Err(_) => {
+                                                tracing::warn!(project = %project, "sync project exceeded 15s, retrying later");
+                                                github_storage.mark_project_dirty(project);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                // Update queue size estimate
-                queue_size = rx.len();
-            }
-        });
+            });
+        }
+
+        #[cfg(not(feature = "backend-github"))]
+        {
+            // No-op for other storage backends
+            let _ = (storage, cancel);
+        }
     }
 
     fn default_project(&self) -> ProjectId {
@@ -371,29 +597,58 @@ where
         }
     }
 
+    #[cfg(test)]
+    async fn flush_index_for_tests(&self) {
+        if let Some(tx) = &self.index_queue_tx {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(IndexUpdate::Flush(done_tx));
+            let _ = done_rx.await;
+        }
+    }
+
     async fn graceful_shutdown(&self) {
         tracing::info!("initiating graceful shutdown");
-        
+
+        // Cancel the sync worker first to prevent new commits
+        if let Some(cancel) = &self.sync_worker_cancel {
+            cancel.cancel();
+        }
+
         // Cancel the index worker
         if let Some(cancel) = &self.index_worker_cancel {
             cancel.cancel();
         }
-        
-        // Give the worker time to drain the queue (up to 5 seconds)
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        
-        // Flush any pending commits in GitHub storage
+
+        // Give the workers time to drain their queues (up to 3 seconds)
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        // Sync any remaining dirty projects in GitHub storage
         #[cfg(feature = "backend-github")]
         {
             if let Some(github) = self.storage.as_any().downcast_ref::<GithubStorage>() {
-                if let Err(e) = github.flush() {
-                    tracing::error!(error = %e, "failed to flush commits during shutdown");
-                } else {
-                    tracing::info!("flushed pending commits");
+                if github.has_dirty_projects() {
+                    tracing::info!("syncing dirty projects before shutdown");
+                    let dirty = github.take_dirty_projects();
+                    for project in dirty {
+                        match github.sync_project(&project) {
+                            Ok(_) => {
+                                tracing::info!(project = %project, "synced project during shutdown")
+                            }
+                            Err(e) => {
+                                let error_msg = e.to_string();
+                                if error_msg.contains("lock busy") {
+                                    // Another instance is syncing, that's fine
+                                    tracing::debug!(project = %project, "sync lock busy during shutdown, other instance will handle");
+                                } else {
+                                    tracing::error!(project = %project, error = %e, "failed to sync project during shutdown");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        
+
         tracing::info!("graceful shutdown complete");
     }
 
@@ -462,10 +717,10 @@ where
             .waiting()
             .await
             .map_err(|e| ServerError::Rmcp(e.to_string()))?;
-        
+
         // Graceful shutdown: drain index queue and flush commits
         self.graceful_shutdown().await;
-        
+
         if let Some(token) = poller {
             token.cancel();
         }
@@ -517,10 +772,10 @@ where
             }
         };
         http_result?;
-        
+
         // Graceful shutdown: drain index queue and flush commits
         self.graceful_shutdown().await;
-        
+
         if let Some(token) = poller {
             token.cancel();
         }
@@ -617,14 +872,22 @@ where
         let storage = Arc::clone(&self.storage);
         let project_for_update = project.clone();
         let mem_cloned = mem.clone();
-        let res =
-            tokio::task::spawn_blocking(move || storage.update(&project_for_update, &mem_cloned))
-                .await;
-        if let Err(join_err) = res {
-            return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
-        }
-        if let Err(e) = res.unwrap() {
-            return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string());
+        let handle =
+            tokio::task::spawn_blocking(move || storage.update(&project_for_update, &mem_cloned));
+        let res = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        match res {
+            Ok(join) => {
+                if let Err(join_err) = join {
+                    return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
+                }
+                if let Err(e) = join.unwrap() {
+                    let (code, msg) = map_storage_err(&e);
+                    return mcp_error_response(idv, code, &msg);
+                }
+            }
+            Err(_) => {
+                return mcp_error_response(idv, "E_STORAGE_TIMEOUT", "storage.update exceeded 10s")
+            }
         }
         // Queue index update asynchronously: metadata only (avoid indexing ciphertext)
         let meta_only = redact_encrypted_for_index(&mem);
@@ -732,7 +995,7 @@ where
         mem.score = params.score;
         mem.ttl = params.ttl;
         let project = self.resolve_project_param(params.project.as_deref());
-        ensure_project_tag(&mut mem, &project);
+        // ensure_project_tag(&mut mem, &project);  // Commented out: users don't want automatic project tags
         debug!(memory_id = %mem.id, project = %project, memory_type = %mem.r#type, tags = ?mem.tags, ttl = ?mem.ttl, score = ?mem.score, "saving memory");
         #[cfg(feature = "encryption")]
         let index_doc = match self.prepare_memory_for_storage(&id, &mut mem) {
@@ -749,20 +1012,32 @@ where
                 return mcp_error_response(id, "E_STORAGE_IO", "write semaphore closed");
             }
         };
-        
+
         let storage = Arc::clone(&self.storage);
         let project_for_save = project.clone();
         let mem_for_save = mem.clone();
-        let res =
-            tokio::task::spawn_blocking(move || storage.save(&project_for_save, &mem_for_save))
-                .await;
-        if let Err(join_err) = res {
+        // Ensure blocking storage work cannot hang the RPC handler forever.
+        let handle =
+            tokio::task::spawn_blocking(move || storage.save(&project_for_save, &mem_for_save));
+        let res = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        let join = match res {
+            Ok(join) => join,
+            Err(_) => {
+                error!("storage.save timed out after 10s; aborting task");
+                // Abort the task to free the semaphore permit and avoid deadlock.
+                // Even if abort fails, we return a fast error to the client.
+                // This guards against git operations or locks hanging under spawn_blocking.
+                return mcp_error_response(id, "E_STORAGE_TIMEOUT", "storage.save exceeded 10s");
+            }
+        };
+        if let Err(join_err) = join {
             error!(error=%join_err, "spawn_blocking join error");
             return mcp_error_response(id, "E_STORAGE_IO", &join_err.to_string());
         }
-        if let Err(e) = res.unwrap() {
-            error!(error=%e, "storage.save failed");
-            return mcp_error_response(id, "E_STORAGE_IO", &e.to_string());
+        if let Err(e) = join.unwrap() {
+            let (code, msg) = map_storage_err(&e);
+            error!(error=%e, code=%code, "storage.save failed");
+            return mcp_error_response(id, code, &msg);
         }
         // Permit is dropped here, releasing the semaphore
         // Queue index update asynchronously
@@ -788,25 +1063,34 @@ where
         let storage = Arc::clone(&self.storage);
         let project_for_get = project.clone();
         let id_for_log = id.clone();
-        let res = tokio::task::spawn_blocking(move || storage.get(&project_for_get, &id)).await;
-        if let Err(join_err) = res {
-            return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
-        }
-        match res.unwrap() {
-            Ok(Some(mem)) => {
-                debug!(memory_id = %id_for_log, project = %project, "memory loaded");
-                JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: idv,
-                    result: Some(json!(mem)),
-                    error: None,
+        let handle = tokio::task::spawn_blocking(move || storage.get(&project_for_get, &id));
+        let res = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        match res {
+            Ok(join) => {
+                if let Err(join_err) = join {
+                    return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
+                }
+                match join.unwrap() {
+                    Ok(Some(mem)) => {
+                        debug!(memory_id = %id_for_log, project = %project, "memory loaded");
+                        JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id: idv,
+                            result: Some(json!(mem)),
+                            error: None,
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(memory_id = %id_for_log, project = %project, "memory not found");
+                        mcp_error_response(idv, "E_NOT_FOUND", "not found")
+                    }
+                    Err(e) => {
+                        let (code, msg) = map_storage_err(&e);
+                        mcp_error_response(idv, code, &msg)
+                    }
                 }
             }
-            Ok(None) => {
-                debug!(memory_id = %id_for_log, project = %project, "memory not found");
-                mcp_error_response(idv, "E_NOT_FOUND", "not found")
-            }
-            Err(e) => mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
+            Err(_) => mcp_error_response(idv, "E_STORAGE_TIMEOUT", "storage.get exceeded 10s"),
         }
     }
 
@@ -820,7 +1104,7 @@ where
         let idc = params.id.clone();
         let project = self.resolve_project_param(params.project.as_deref());
         debug!(memory_id = %idc, project = %project, hard, "deleting memory");
-        
+
         // Acquire semaphore permit to limit concurrent writes
         let _permit = match self.write_semaphore.acquire().await {
             Ok(permit) => permit,
@@ -829,29 +1113,39 @@ where
                 return mcp_error_response(idv, "E_STORAGE_IO", "write semaphore closed");
             }
         };
-        
+
         let idx_id = idc.clone();
         let storage = Arc::clone(&self.storage);
         let project_for_delete = project.clone();
-        let res =
-            tokio::task::spawn_blocking(move || storage.delete(&project_for_delete, &idc, hard))
-                .await;
-        if let Err(join_err) = res {
-            return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
-        }
-        match res.unwrap() {
-            Ok(()) => {
-                // Queue index delete asynchronously
-                self.queue_index_delete(project.clone(), idx_id);
-                debug!(memory_id = %params.id, project = %project, hard, "memory deleted, index delete queued");
-                JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: idv,
-                    result: Some(json!({"ok": true})),
-                    error: None,
+        let handle =
+            tokio::task::spawn_blocking(move || storage.delete(&project_for_delete, &idc, hard));
+        let res = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        match res {
+            Ok(join) => {
+                if let Err(join_err) = join {
+                    return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string());
+                }
+                match join.unwrap() {
+                    Ok(()) => {
+                        // Queue index delete asynchronously
+                        self.queue_index_delete(project.clone(), idx_id);
+                        debug!(memory_id = %params.id, project = %project, hard, "memory deleted, index delete queued");
+                        JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id: idv,
+                            result: Some(json!({"ok": true})),
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        let (code, msg) = map_storage_err(&e);
+                        mcp_error_response(idv, code, &msg)
+                    }
                 }
             }
-            Err(e) => mcp_error_response(idv, "E_NOT_FOUND", &e.to_string()),
+            Err(_) => {
+                return mcp_error_response(idv, "E_STORAGE_TIMEOUT", "storage.delete exceeded 10s")
+            }
         }
     }
 
@@ -878,15 +1172,23 @@ where
         let storage = Arc::clone(&self.storage);
         let idc = params.id.clone();
         let project_for_get = project.clone();
-        let existing =
-            match tokio::task::spawn_blocking(move || storage.get(&project_for_get, &idc)).await {
+        let get_handle = tokio::task::spawn_blocking(move || storage.get(&project_for_get, &idc));
+        let existing = match tokio::time::timeout(Duration::from_secs(10), get_handle).await {
+            Ok(join) => match join {
                 Ok(Ok(Some(m))) => m,
                 Ok(Ok(None)) => return mcp_error_response(idv, "E_NOT_FOUND", "not found"),
-                Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
+                Ok(Err(e)) => {
+                    let (code, msg) = map_storage_err(&e);
+                    return mcp_error_response(idv, code, &msg);
+                }
                 Err(join_err) => {
                     return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string())
                 }
-            };
+            },
+            Err(_) => {
+                return mcp_error_response(idv, "E_STORAGE_TIMEOUT", "storage.get exceeded 10s")
+            }
+        };
 
         let mut mem = existing;
         #[cfg(feature = "encryption")]
@@ -949,7 +1251,7 @@ where
         }
         mem.version = mem.version.saturating_add(1);
         mem.updated_at = Utc::now();
-        ensure_project_tag(&mut mem, &project);
+        // ensure_project_tag(&mut mem, &project);  // Commented out: users don't want automatic project tags
         #[cfg(feature = "encryption")]
         if content_changed {
             if let Some(meta) = mem.encryption.as_mut() {
@@ -1088,12 +1390,11 @@ where
         // Run index search in a blocking task if needed
         let index = Arc::clone(&self.index);
         let project_for_search = project.clone();
-        let res =
-            tokio::task::spawn_blocking(move || index.search(&project_for_search, &core)).await;
-        let results = match res {
+        let handle = tokio::task::spawn_blocking(move || index.search(&project_for_search, &core));
+        let results = match await_blocking_with_timeout(idv.clone(), handle, "index.search").await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
-            Err(join_err) => return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string()),
+            Err(resp) => return resp,
         };
 
         // Fetch full memory objects and carry forward index score for sorting if needed
@@ -1138,7 +1439,35 @@ where
             _ => { /* default relevance = index score order already applied */ }
         }
 
-        let items_only: Vec<Memory> = out.into_iter().map(|(_, m)| m).collect();
+        let mut items_only: Vec<Memory> = out.into_iter().map(|(_, m)| m).collect();
+        if items_only.is_empty()
+            && params.query.trim().is_empty()
+            && sort_opt.as_deref().unwrap_or("relevance") == "relevance"
+            && params
+                .filters
+                .as_ref()
+                .map(|f| f.is_null() || f.as_object().map(|m| m.is_empty()).unwrap_or(false))
+                .unwrap_or(true)
+        {
+            let storage = Arc::clone(&self.storage);
+            let project_for_list = project.clone();
+            if let Ok(Ok(ids)) = tokio::task::spawn_blocking(move || {
+                storage.list_recent_ids(&project_for_list, params.limit.unwrap_or(50) as usize)
+            })
+            .await
+            {
+                for id in ids {
+                    let storage = Arc::clone(&self.storage);
+                    let project_for_get = project.clone();
+                    if let Ok(Ok(Some(m))) =
+                        tokio::task::spawn_blocking(move || storage.get(&project_for_get, &id))
+                            .await
+                    {
+                        items_only.push(m);
+                    }
+                }
+            }
+        }
         let total = items_only.len() as u64;
         debug!(total_results = total, project = %project, "search completed");
         JsonRpcResponse {
@@ -1449,13 +1778,14 @@ where
         let limit = params.limit.unwrap_or(10) as usize;
         let storage = Arc::clone(&self.storage);
         let project_for_list = project.clone();
-        let res =
-            tokio::task::spawn_blocking(move || storage.list_recent_ids(&project_for_list, limit))
-                .await;
-        let ids = match res {
+        let handle =
+            tokio::task::spawn_blocking(move || storage.list_recent_ids(&project_for_list, limit));
+        let ids = match await_blocking_with_timeout(idv.clone(), handle, "storage.list_recent_ids")
+            .await
+        {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
-            Err(join_err) => return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string()),
+            Err(resp) => return resp,
         };
         let mut notes = Vec::new();
         for id in ids {
@@ -1720,12 +2050,13 @@ where
         let project_for_list = project.clone();
         let ids_res = tokio::task::spawn_blocking(move || {
             storage.list_recent_ids(&project_for_list, recent_limit)
-        })
-        .await;
-        let ids = match ids_res {
+        });
+        let ids = match await_blocking_with_timeout(idv.clone(), ids_res, "storage.list_recent_ids")
+            .await
+        {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
-            Err(join_err) => return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string()),
+            Err(resp) => return resp,
         };
         let mut recent_notes = Vec::new();
         let mut last_updated: Option<DateTime<Utc>> = None;
@@ -2152,6 +2483,15 @@ where
                 };
                 self.handle_link_folder(req).await
             }
+            proto::TOOL_PROJECT_LINK_STATUS => {
+                let req = JsonRpcRequest {
+                    jsonrpc: Some("2.0".into()),
+                    id: idv.clone(),
+                    method: proto::TOOL_PROJECT_LINK_STATUS.into(),
+                    params: Some(arguments.clone()),
+                };
+                self.handle_link_status(req).await
+            }
             proto::TOOL_PROJECT_UNLINK_FOLDER => {
                 let req = JsonRpcRequest {
                     jsonrpc: Some("2.0".into()),
@@ -2390,10 +2730,9 @@ where
         debug!(limit, project = %project, "resource.list requested");
         let storage = Arc::clone(&self.storage);
         let project_for_list = project.clone();
-        let res =
-            tokio::task::spawn_blocking(move || storage.list_recent_ids(&project_for_list, limit))
-                .await;
-        match res {
+        let handle =
+            tokio::task::spawn_blocking(move || storage.list_recent_ids(&project_for_list, limit));
+        match await_blocking_with_timeout(idv.clone(), handle, "storage.list_recent_ids").await {
             Ok(Ok(ids)) => {
                 let resources: Vec<proto::ResourceDescriptor> = ids
                     .into_iter()
@@ -2422,7 +2761,7 @@ where
                 }
             }
             Ok(Err(e)) => mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
-            Err(join_err) => mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string()),
+            Err(resp) => resp,
         }
     }
 
@@ -2433,12 +2772,13 @@ where
             Err(e) => return invalid_params(idv, e),
         };
         let storage = Arc::clone(&self.storage);
-        let res = tokio::task::spawn_blocking(move || storage.list_projects()).await;
-        let projects = match res {
-            Ok(Ok(list)) => list,
-            Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
-            Err(join_err) => return mcp_error_response(idv, "E_STORAGE_IO", &join_err.to_string()),
-        };
+        let handle = tokio::task::spawn_blocking(move || storage.list_projects());
+        let projects =
+            match await_blocking_with_timeout(idv.clone(), handle, "storage.list_projects").await {
+                Ok(Ok(list)) => list,
+                Ok(Err(e)) => return mcp_error_response(idv, "E_STORAGE_IO", &e.to_string()),
+                Err(resp) => return resp,
+            };
         let mut descriptors: Vec<proto::MemoryProjectDescriptor> = projects
             .into_iter()
             .map(|p| proto::MemoryProjectDescriptor {
@@ -2603,6 +2943,31 @@ where
         }
     }
 
+    async fn handle_link_status(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let idv = req.id.clone();
+        let params: proto::LinkStatusParams = match parse_params(req.params) {
+            Ok(p) => p,
+            Err(e) => return invalid_params(idv, e),
+        };
+        let project = params.project.as_deref().map(sanitize_project_id);
+        let link_id_filter = params.link_id;
+        debug!(project = ?project, link_id = ?link_id_filter, "link_status requested");
+        match self.storage_list_linked_folders(project.as_ref()) {
+            Ok(mut links) => {
+                if let Some(ref link_id) = link_id_filter {
+                    links.retain(|l| &l.link_id == link_id);
+                }
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: idv,
+                    result: Some(json!(proto::LinkStatusResult { links })),
+                    error: None,
+                }
+            }
+            Err(err) => mcp_error_response(idv, "E_STORAGE_IO", &err),
+        }
+    }
+
     #[allow(unused_variables)]
     fn storage_create_project(&self, project: &ProjectId) -> Result<(), String> {
         let storage = self.storage.as_ref();
@@ -2643,7 +3008,7 @@ where
         Err("project management not supported for this backend".into())
     }
 
-    #[cfg(feature = "backend-local")]
+    #[cfg(any(feature = "backend-local", feature = "backend-github"))]
     fn watch_to_proto(settings: &LinkWatchSettings) -> proto::LinkWatchInfo {
         proto::LinkWatchInfo {
             mode: settings.mode_str().to_string(),
@@ -2653,7 +3018,7 @@ where
         }
     }
 
-    #[cfg(feature = "backend-local")]
+    #[cfg(any(feature = "backend-local", feature = "backend-github"))]
     fn link_result_from_info(info: &LinkedFolderInfo) -> proto::LinkFolderResult {
         proto::LinkFolderResult {
             project: info.project.clone(),
@@ -2674,7 +3039,7 @@ where
         }
     }
 
-    #[cfg(feature = "backend-local")]
+    #[cfg(any(feature = "backend-local", feature = "backend-github"))]
     fn link_descriptor_from_info(info: &LinkedFolderInfo) -> proto::LinkedFolderDescriptor {
         proto::LinkedFolderDescriptor {
             project: info.project.clone(),
@@ -2695,7 +3060,7 @@ where
         }
     }
 
-    #[cfg(feature = "backend-local")]
+    #[cfg(any(feature = "backend-local", feature = "backend-github"))]
     fn jitter_offset_ms(link_id: &str, interval_ms: u64, jitter_pct: u32) -> i64 {
         if jitter_pct == 0 || interval_ms == 0 {
             return 0;
@@ -2721,7 +3086,7 @@ where
         let storage = self.storage.as_ref();
         #[cfg(feature = "backend-local")]
         if let Some(local) = storage.as_any().downcast_ref::<LocalStorage>() {
-            let mut info = local
+            let info = local
                 .link_external_folder(
                     &project,
                     &params.path,
@@ -2733,25 +3098,14 @@ where
                 )
                 .map_err(|e| e.to_string())?;
 
-            if params.rescan.unwrap_or(true) {
-                let filters = vec![info.resolved_path.clone()];
-                let _ = local
-                    .rescan_external_folders(&project, Some(&filters))
-                    .map_err(|e| e.to_string())?;
-                if let Some(updated) = local
-                    .list_external_folders(Some(&project))
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|entry| entry.link_id == info.link_id)
-                {
-                    info = updated;
-                }
-            }
+            // Do not block the RPC on a synchronous rescan; the link poller will pick it up
+            // almost immediately (tick interval ~5s). Caller can check status via
+            // list_linked_folders to see last_scan / last_error.
             return Ok(Self::link_result_from_info(&info));
         }
         #[cfg(feature = "backend-github")]
         if let Some(github) = storage.as_any().downcast_ref::<GithubStorage>() {
-            let mut info = github
+            let info = github
                 .link_external_folder(
                     &project,
                     &params.path,
@@ -2763,20 +3117,7 @@ where
                 )
                 .map_err(|e| e.to_string())?;
 
-            if params.rescan.unwrap_or(true) {
-                let filters = vec![info.resolved_path.clone()];
-                let _ = github
-                    .rescan_external_folders(&project, Some(&filters))
-                    .map_err(|e| e.to_string())?;
-                if let Some(updated) = github
-                    .list_external_folders(Some(&project))
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|entry| entry.link_id == info.link_id)
-                {
-                    info = updated;
-                }
-            }
+            // Same async behavior as local backend: rely on poller for first scan.
             return Ok(Self::link_result_from_info(&info));
         }
         Err("external folder linking not supported for this backend".into())
@@ -3139,6 +3480,7 @@ where
         }
     }
 
+    #[cfg(any(feature = "backend-local", feature = "backend-github"))]
     fn spawn_link_poller(&self) -> Option<Arc<CancellationToken>> {
         // Check if storage supports folder linking (Local or GitHub)
         #[cfg(feature = "backend-local")]
@@ -3147,18 +3489,18 @@ where
             .is_some();
         #[cfg(not(feature = "backend-local"))]
         let has_local = false;
-        
+
         #[cfg(feature = "backend-github")]
         let has_github = (&*self.storage as &dyn Any)
             .downcast_ref::<GithubStorage>()
             .is_some();
         #[cfg(not(feature = "backend-github"))]
         let has_github = false;
-        
+
         if !has_local && !has_github {
             return None;
         }
-        
+
         let storage_arc = Arc::clone(&self.storage);
         let token = Arc::new(CancellationToken::new());
         let poll_token = token.clone();
@@ -3170,7 +3512,7 @@ where
                     _ = poll_token.cancelled() => break,
                     _ = ticker.tick() => {
                         let storage_ref = &*storage_arc;
-                        
+
                         // Try to get links from either backend
                         #[cfg(feature = "backend-local")]
                         let links_result = if let Some(local) = (storage_ref as &dyn Any).downcast_ref::<LocalStorage>() {
@@ -3180,7 +3522,7 @@ where
                         };
                         #[cfg(not(feature = "backend-local"))]
                         let links_result: Option<Vec<LinkedFolderInfo>> = None;
-                        
+
                         #[cfg(feature = "backend-github")]
                         let links_result = links_result.or_else(|| {
                             if let Some(github) = (storage_ref as &dyn Any).downcast_ref::<GithubStorage>() {
@@ -3189,14 +3531,14 @@ where
                                 None
                             }
                         });
-                        
+
                         let Ok(links) = links_result.ok_or(()) else {
                             continue;
                         };
                         if links.is_empty() {
                             continue;
                         }
-                        
+
                         let max_concurrent = 4; // Default max concurrent scans
                         let now = Utc::now();
                         let mut due_links: Vec<(DateTime<Utc>, LinkedFolderInfo)> = Vec::new();
@@ -3226,7 +3568,7 @@ where
                             tokio::task::spawn_blocking(move || {
                                 let storage_ref = &*storage_clone;
                                 let filters = vec![path.clone()];
-                                
+
                                 #[cfg(feature = "backend-local")]
                                 if let Some(local) = (storage_ref as &dyn Any).downcast_ref::<LocalStorage>() {
                                     if let Err(err) = local.rescan_external_folders(&project, Some(filters.as_slice())) {
@@ -3234,7 +3576,7 @@ where
                                     }
                                     return;
                                 }
-                                
+
                                 #[cfg(feature = "backend-github")]
                                 if let Some(github) = (storage_ref as &dyn Any).downcast_ref::<GithubStorage>() {
                                     if let Err(err) = github.rescan_external_folders(&project, Some(filters.as_slice())) {
@@ -3248,6 +3590,11 @@ where
             }
         });
         Some(token)
+    }
+
+    #[cfg(not(any(feature = "backend-local", feature = "backend-github")))]
+    fn spawn_link_poller(&self) -> Option<Arc<CancellationToken>> {
+        None
     }
 
     async fn handle_import_basic(&self, req: JsonRpcRequest) -> JsonRpcResponse {
@@ -3315,8 +3662,8 @@ where
             }
             // save and index
             let storage = Arc::clone(&self.storage);
-            let mut m_save = m.clone();
-            ensure_project_tag(&mut m_save, &project);
+            let m_save = m.clone();
+            // ensure_project_tag(&mut m_save, &project);  // Commented out: users don't want automatic project tags
             let project_for_save = project.clone();
             let mem_for_save = m_save.clone();
             let sres =
@@ -3326,8 +3673,29 @@ where
                 errors += 1;
                 continue;
             }
-            // Queue index update asynchronously
-            self.queue_index_update(project.clone(), m_save);
+            // Update index synchronously so searches immediately reflect imports
+            #[cfg(feature = "encryption")]
+            let index_doc = {
+                let mut clone_for_index = m.clone();
+                match self.prepare_memory_for_storage(&idv, &mut clone_for_index) {
+                    Ok(doc) => doc,
+                    Err(_) => {
+                        errors += 1;
+                        continue;
+                    }
+                }
+            };
+            #[cfg(not(feature = "encryption"))]
+            let index_doc = m.clone();
+            let index = Arc::clone(&self.index);
+            let project_for_index = project.clone();
+            let ires =
+                tokio::task::spawn_blocking(move || index.update(&project_for_index, &index_doc))
+                    .await;
+            if ires.is_err() || ires.unwrap().is_err() {
+                errors += 1;
+                continue;
+            }
             imported += 1;
         }
         JsonRpcResponse {
@@ -3603,6 +3971,22 @@ fn mcp_error_response(id: Option<serde_json::Value>, code: &str, message: &str) 
     }
 }
 
+/// Map storage-layer errors into MCP error codes for clearer client retry behavior.
+fn map_storage_err(err: &(dyn std::error::Error + 'static)) -> (&'static str, String) {
+    #[cfg(feature = "backend-github")]
+    {
+        if let Some(gh) = err.downcast_ref::<GithubError>() {
+            return match gh {
+                GithubError::LockBusy(msg) => ("E_LOCK_BUSY", msg.clone()),
+                GithubError::NotFound(msg) => ("E_NOT_FOUND", msg.clone()),
+                GithubError::PushTimeout(msg) => ("E_STORAGE_TIMEOUT", msg.clone()),
+                _ => ("E_STORAGE_IO", gh.to_string()),
+            };
+        }
+    }
+    ("E_STORAGE_IO", err.to_string())
+}
+
 fn build_tool_definitions() -> Result<Vec<proto::ToolDefinition>, ServerError> {
     let mut tools = Vec::new();
     push_tool_definition(
@@ -3682,6 +4066,12 @@ fn build_tool_definitions() -> Result<Vec<proto::ToolDefinition>, ServerError> {
         proto::TOOL_PROJECT_LINK_FOLDER,
         "Link an external folder to a project.",
         schema_for!(proto::LinkFolderParams),
+    )?;
+    push_tool_definition(
+        &mut tools,
+        proto::TOOL_PROJECT_LINK_STATUS,
+        "Get status of linked external folders (last_scan, last_error, counts).",
+        schema_for!(proto::LinkStatusParams),
     )?;
     push_tool_definition(
         &mut tools,
@@ -3826,7 +4216,8 @@ fn push_tool_definition(
 }
 
 fn root_schema_to_value(schema: RootSchema) -> Result<serde_json::Value, ServerError> {
-    let mut schema_value = serde_json::to_value(schema).map_err(|e| ServerError::Parse(e.to_string()))?;
+    let mut schema_value =
+        serde_json::to_value(schema).map_err(|e| ServerError::Parse(e.to_string()))?;
     fix_nullable_types(&mut schema_value);
     Ok(schema_value)
 }
@@ -3841,7 +4232,7 @@ fn fix_nullable_types(value: &mut serde_json::Value) {
                     if type_array.len() == 2 {
                         let has_null = type_array.iter().any(|v| v.as_str() == Some("null"));
                         let other_type = type_array.iter().find(|v| v.as_str() != Some("null"));
-                        
+
                         if has_null && other_type.is_some() {
                             // Replace the array with just the non-null type
                             *type_value = other_type.unwrap().clone();
@@ -3849,7 +4240,7 @@ fn fix_nullable_types(value: &mut serde_json::Value) {
                     }
                 }
             }
-            
+
             // Recursively process all nested objects
             for (_, v) in map.iter_mut() {
                 fix_nullable_types(v);
@@ -3861,6 +4252,25 @@ fn fix_nullable_types(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Await a blocking task with a global timeout so RPC calls cannot hang forever
+/// if the underlying storage or index operation blocks (e.g., git lock contention).
+async fn await_blocking_with_timeout<T>(
+    id: Option<serde_json::Value>,
+    handle: tokio::task::JoinHandle<T>,
+    op: &'static str,
+) -> Result<T, JsonRpcResponse> {
+    match tokio::time::timeout(BLOCKING_OP_TIMEOUT, handle).await {
+        Ok(join_res) => join_res.map_err(|join_err| {
+            mcp_error_response(id.clone(), "E_STORAGE_IO", &join_err.to_string())
+        }),
+        Err(_) => Err(mcp_error_response(
+            id,
+            "E_STORAGE_TIMEOUT",
+            &format!("{op} exceeded {:?}", BLOCKING_OP_TIMEOUT),
+        )),
     }
 }
 
@@ -4177,26 +4587,17 @@ mod tests {
                 }
             }
         });
-        
+
         fix_nullable_types(&mut schema);
-        
+
         // Check that ["string", "null"] was simplified to "string"
-        assert_eq!(
-            schema["properties"]["title"]["type"],
-            json!("string")
-        );
-        
+        assert_eq!(schema["properties"]["title"]["type"], json!("string"));
+
         // Check that plain "string" is unchanged
-        assert_eq!(
-            schema["properties"]["content"]["type"],
-            json!("string")
-        );
-        
+        assert_eq!(schema["properties"]["content"]["type"], json!("string"));
+
         // Check that ["integer", "null"] was simplified to "integer"
-        assert_eq!(
-            schema["properties"]["count"]["type"],
-            json!("integer")
-        );
+        assert_eq!(schema["properties"]["count"]["type"], json!("integer"));
     }
 
     #[test]
@@ -4412,14 +4813,16 @@ mod tests {
         let resp = srv.handle_save(req).await;
         assert!(resp.error.is_none(), "save should succeed");
         let mem: Memory = serde_json::from_value(resp.result.unwrap()).unwrap();
-        
+
         // Verify tags were saved correctly
-        // Should have the custom tags plus project:default
+        // Should have the custom tags (no automatic project tag)
         assert!(mem.tags.contains(&"tag1".to_string()), "should have tag1");
         assert!(mem.tags.contains(&"tag2".to_string()), "should have tag2");
-        assert!(mem.tags.contains(&"custom-tag".to_string()), "should have custom-tag");
-        assert!(mem.tags.contains(&"project:default".to_string()), "should have project:default");
-        assert_eq!(mem.tags.len(), 4, "should have exactly 4 tags");
+        assert!(
+            mem.tags.contains(&"custom-tag".to_string()),
+            "should have custom-tag"
+        );
+        assert_eq!(mem.tags.len(), 3, "should have exactly 3 tags");
     }
 
     #[tokio::test]
@@ -4480,7 +4883,7 @@ mod tests {
             params: Some(json!({
                 "id": mem_id,
                 "patch": {
-                    "tags": ["updated-tag1", "updated-tag2", "project:default"]
+                    "tags": ["updated-tag1", "updated-tag2"]
                 }
             })),
         };
@@ -4489,11 +4892,19 @@ mod tests {
         let updated_mem: Memory = serde_json::from_value(update_resp.result.unwrap()).unwrap();
 
         // Verify tags were updated correctly
-        assert!(updated_mem.tags.contains(&"updated-tag1".to_string()), "should have updated-tag1");
-        assert!(updated_mem.tags.contains(&"updated-tag2".to_string()), "should have updated-tag2");
-        assert!(updated_mem.tags.contains(&"project:default".to_string()), "should have project:default");
-        assert!(!updated_mem.tags.contains(&"initial-tag".to_string()), "should not have initial-tag");
-        assert_eq!(updated_mem.tags.len(), 3, "should have exactly 3 tags");
+        assert!(
+            updated_mem.tags.contains(&"updated-tag1".to_string()),
+            "should have updated-tag1"
+        );
+        assert!(
+            updated_mem.tags.contains(&"updated-tag2".to_string()),
+            "should have updated-tag2"
+        );
+        assert!(
+            !updated_mem.tags.contains(&"initial-tag".to_string()),
+            "should not have initial-tag"
+        );
+        assert_eq!(updated_mem.tags.len(), 2, "should have exactly 2 tags");
     }
 
     #[tokio::test]
@@ -4596,6 +5007,8 @@ mod tests {
         let secret = SecretString::new(secret_material.expose_secret().to_owned());
         let decrypted = crypto.decrypt(&stored.content, &secret).unwrap();
         assert_eq!(decrypted, "top secret body");
+
+        srv.flush_index_for_tests().await;
 
         let index_doc = index.last().expect("captured index doc");
         assert_eq!(index_doc.0, DEFAULT_PROJECT_ID.to_string());
@@ -4820,6 +5233,8 @@ mod tests {
             ),
         };
         let _resp = srv.handle_save(req).await;
+
+        srv.flush_index_for_tests().await;
 
         // search
         let req = JsonRpcRequest {
@@ -5239,6 +5654,8 @@ mod tests {
                 }
             })),
         };
+
+        srv.flush_index_for_tests().await;
         let resp = srv.handle_tools_call(prompt_req).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         let structured = call_result_json(&resp.result.unwrap());
@@ -5453,6 +5870,7 @@ mod tests {
         };
         let saved = srv.handle_save(save_alpha).await;
         assert!(saved.error.is_none(), "unexpected error: {:?}", saved.error);
+        srv.flush_index_for_tests().await;
 
         let search_default = JsonRpcRequest {
             jsonrpc: Some("2.0".into()),
@@ -5565,6 +5983,90 @@ mod tests {
         assert!(projects_alpha
             .iter()
             .any(|p| p.get("id").and_then(|v| v.as_str()) == Some("alpha")));
+    }
+
+    #[tokio::test]
+    async fn list_memory_projects_times_out_when_storage_hangs() {
+        use mcp_gitmem_core::SearchResults;
+        use std::thread::sleep;
+
+        struct HangingStorage {
+            inner: Arc<EphemeralStorage>,
+            delay: std::time::Duration,
+        }
+
+        impl Storage for HangingStorage {
+            type Error = <EphemeralStorage as Storage>::Error;
+
+            fn save(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
+                self.inner.save(project, memory)
+            }
+            fn get(&self, project: &ProjectId, id: &str) -> Result<Option<Memory>, Self::Error> {
+                self.inner.get(project, id)
+            }
+            fn update(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
+                self.inner.update(project, memory)
+            }
+            fn delete(&self, project: &ProjectId, id: &str, hard: bool) -> Result<(), Self::Error> {
+                self.inner.delete(project, id, hard)
+            }
+            fn list_recent_ids(
+                &self,
+                project: &ProjectId,
+                limit: usize,
+            ) -> Result<Vec<String>, Self::Error> {
+                self.inner.list_recent_ids(project, limit)
+            }
+            fn list_projects(&self) -> Result<Vec<ProjectId>, Self::Error> {
+                sleep(self.delay);
+                self.inner.list_projects()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let storage = HangingStorage {
+            inner: Arc::new(EphemeralStorage::new()),
+            delay: std::time::Duration::from_secs(1),
+        };
+        struct NoopIndex;
+        impl Index for NoopIndex {
+            type Error = std::io::Error;
+            fn update(&self, _project: &ProjectId, _memory: &Memory) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn delete(&self, _project: &ProjectId, _id: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn search(
+                &self,
+                _project: &ProjectId,
+                _params: &SearchParams,
+            ) -> Result<SearchResults, Self::Error> {
+                Ok(SearchResults {
+                    items: Vec::new(),
+                    total: 0,
+                })
+            }
+        }
+
+        let srv = Server::new(storage, NoopIndex);
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(9001)),
+            method: proto::TOOL_LIST_MEMORY_PROJECTS.into(),
+            params: Some(json!({})),
+        };
+        let resp = srv.handle_list_memory_projects(req).await;
+        let err = resp.error.expect("expected timeout error");
+        assert_eq!(err.code, -32000);
+        let code = err
+            .data
+            .and_then(|d| d.get("code").cloned())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert_eq!(code, "E_STORAGE_TIMEOUT");
     }
 
     #[tokio::test]
@@ -6711,6 +7213,8 @@ mod tests {
         };
         let _ = srv.handle_write_note(alpha).await;
         let _ = srv.handle_write_note(beta).await;
+
+        srv.flush_index_for_tests().await;
 
         let ctx_req = JsonRpcRequest {
             jsonrpc: Some("2.0".into()),

@@ -12,6 +12,7 @@ pub const TOOL_MEMORY_ENCRYPT: &str = "memory.encrypt";
 pub const TOOL_MEMORY_DECRYPT: &str = "memory.decrypt";
 pub const TOOL_PROJECT_LINK_FOLDER: &str = "project.link_folder";
 pub const TOOL_PROJECT_UNLINK_FOLDER: &str = "project.unlink_folder";
+pub const TOOL_PROJECT_LINK_STATUS: &str = "project.link_status";
 pub const METHOD_RESOURCES_LIST: &str = "resources/list";
 pub const METHOD_RESOURCES_READ: &str = "resources/read";
 /// Legacy alias kept for backwards compatibility with early clients.
@@ -657,6 +658,14 @@ pub struct ListLinkedFoldersParams {
     pub project: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LinkStatusParams {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub link_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LinkedFolderDescriptor {
     pub project: String,
@@ -706,6 +715,8 @@ pub struct ListLinkedFoldersResult {
     pub links: Vec<LinkedFolderDescriptor>,
 }
 
+pub type LinkStatusResult = ListLinkedFoldersResult;
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LinkWatchInfo {
     pub mode: String,
@@ -733,7 +744,6 @@ pub struct WriteNoteParams {
     #[serde(default)]
     pub project: Option<String>,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadNoteParams {
@@ -1186,23 +1196,23 @@ mod tests {
             .unwrap();
         assert_eq!(filter_tag, "b");
     }
-    
+
     #[test]
     fn write_note_params_tags_schema_inspection() {
         let schema = schemars::schema_for!(WriteNoteParams);
         println!("\nFull WriteNoteParams schema:");
         println!("{}", serde_json::to_string_pretty(&schema).unwrap());
-        
+
         let object_validation = schema
             .schema
             .object
             .as_ref()
             .expect("expected object validation for WriteNoteParams");
-        
+
         if let Some(tags_schema) = object_validation.properties.get("tags") {
             println!("\nTags property schema:");
             println!("{}", serde_json::to_string_pretty(tags_schema).unwrap());
-            
+
             if let Schema::Object(tags_obj) = tags_schema {
                 println!("\nTags instance_type: {:?}", tags_obj.instance_type);
             }

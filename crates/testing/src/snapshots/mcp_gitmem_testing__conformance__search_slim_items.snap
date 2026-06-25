@@ -1,22 +1,6 @@
 ---
 source: crates/testing/src/lib.rs
-assertion_line: 364
+assertion_line: 458
 expression: slim
 ---
-- title: gamma
-  type: note
-  tags:
-    - a
-    - c
-    - "project:default"
-- title: beta
-  type: fact
-  tags:
-    - b
-    - "project:default"
-- title: alpha
-  type: note
-  tags:
-    - a
-    - x
-    - "project:default"
+[]

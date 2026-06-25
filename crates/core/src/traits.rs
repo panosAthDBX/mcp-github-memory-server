@@ -59,6 +59,21 @@ pub trait Index {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn update(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error>;
+
+    fn update_batch(&self, project: &ProjectId, memories: &[Memory]) -> Result<(), Self::Error> {
+        for memory in memories {
+            self.update(project, memory)?;
+        }
+        Ok(())
+    }
+
+    fn delete_batch(&self, project: &ProjectId, ids: &[String]) -> Result<(), Self::Error> {
+        for id in ids {
+            self.delete(project, id)?;
+        }
+        Ok(())
+    }
+
     fn delete(&self, project: &ProjectId, id: &str) -> Result<(), Self::Error>;
     fn search(
         &self,

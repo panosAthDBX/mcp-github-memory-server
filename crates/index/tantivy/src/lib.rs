@@ -29,6 +29,7 @@ mod engine {
         ThreadPoolNoAbortBuilder,
     };
     use parking_lot::RwLock;
+    use serde::{Deserialize, Serialize};
     use serde_json::{Map as JsonMap, Number, Value};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -37,7 +38,8 @@ mod engine {
     use tempfile::TempDir;
 
     const LMDB_MAX_DBS: u32 = 25;
-    const DEFAULT_MAP_SIZE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB per project
+    // Lower default map size to reduce virtual address space per project; overridable via env.
+    const DEFAULT_MAP_SIZE_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB per project
 
     #[derive(Clone)]
     struct Doc {
@@ -60,21 +62,33 @@ mod engine {
             }
         }
 
-        fn update(&self, memory: &Memory) -> Result<(), TantivyIndexError> {
-            let doc = Doc {
-                id: memory.id.clone(),
-                title: memory.title.clone(),
-                content: memory.content.clone(),
-                tags: memory.tags.clone(),
-                r#type: memory.r#type.clone(),
-                score: memory.score,
-            };
-            self.docs.write().insert(doc.id.clone(), doc);
+        fn update_batch(&self, memories: &[Memory]) -> Result<(), TantivyIndexError> {
+            let mut docs = self.docs.write();
+            for memory in memories {
+                let doc = Doc {
+                    id: memory.id.clone(),
+                    title: memory.title.clone(),
+                    content: memory.content.clone(),
+                    tags: memory.tags.clone(),
+                    r#type: memory.r#type.clone(),
+                    score: memory.score,
+                };
+                docs.insert(doc.id.clone(), doc);
+            }
             Ok(())
         }
 
         fn delete(&self, id: &str) -> Result<(), TantivyIndexError> {
-            self.docs.write().remove(id);
+            let mut docs = self.docs.write();
+            docs.remove(id);
+            Ok(())
+        }
+
+        fn delete_batch(&self, ids: &[String]) -> Result<(), TantivyIndexError> {
+            let mut docs = self.docs.write();
+            for id in ids {
+                docs.remove(id);
+            }
             Ok(())
         }
 
@@ -225,6 +239,14 @@ mod engine {
         }
     }
 
+    fn map_size_bytes() -> usize {
+        std::env::var("GITMEM_INDEX_MAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_MAP_SIZE_BYTES)
+    }
+
     impl ProjectHandle {
         fn create(project: ProjectId, path: PathBuf) -> Result<Self, TantivyIndexError> {
             std::fs::create_dir_all(&path)
@@ -232,12 +254,21 @@ mod engine {
 
             let options = EnvOpenOptions::new();
             let mut options = options.read_txn_without_tls();
-            options.map_size(DEFAULT_MAP_SIZE_BYTES);
+            options.map_size(map_size_bytes());
             options.max_dbs(LMDB_MAX_DBS);
 
             let index = MilliIndex::new(options, &path, true)
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
-            let indexer_config = IndexerConfig::default();
+            let indexer_config = {
+                let mut cfg = IndexerConfig::default();
+                // cap indexer heap to avoid ballooning (default can be multi-GB)
+                let max_mb = std::env::var("GITMEM_INDEX_MAX_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(128);
+                cfg.max_memory = Some(max_mb * 1024 * 1024);
+                cfg
+            };
             let index_documents_config = IndexDocumentsConfig {
                 update_method: IndexDocumentsMethod::UpdateDocuments,
                 autogenerate_docids: false,
@@ -247,7 +278,13 @@ mod engine {
             let mut wtxn = index
                 .write_txn()
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
-            {
+
+            // Optimization: Skip settings application if already initialized (primary key exists)
+            let primary_key = index
+                .primary_key(&wtxn)
+                .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
+
+            if primary_key.is_none() {
                 let mut settings = Settings::new(&mut wtxn, &index, &indexer_config);
                 settings.set_primary_key("id".to_string());
                 settings.set_searchable_fields(vec![
@@ -275,10 +312,25 @@ mod engine {
                     FilterableAttributesRule::Field("updated_at".to_string()),
                 ]);
                 settings.set_sortable_fields(
-                    ["updated_at".to_string(), "created_at".to_string()]
-                        .into_iter()
-                        .collect(),
+                    [
+                        "updated_at".to_string(),
+                        "created_at".to_string(),
+                        "score".to_string(),
+                    ]
+                    .into_iter()
+                    .collect(),
                 );
+                // Optimization: Add stop words to reduce index size
+                settings.set_stop_words(
+                    [
+                        "a", "an", "the", "and", "or", "but", "is", "are", "was", "were", "in",
+                        "on", "at", "to", "for", "of", "with", "by",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                );
+
                 settings
                     .execute(|_| {}, || false)
                     .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
@@ -294,38 +346,46 @@ mod engine {
             })
         }
 
-        fn upsert(&self, memory: &Memory) -> Result<(), TantivyIndexError> {
-            let mut object = JsonMap::new();
-            object.insert("id".into(), Value::String(memory.id.clone()));
-            object.insert("title".into(), Value::String(memory.title.clone()));
-            object.insert("content".into(), Value::String(memory.content.clone()));
-            object.insert("type".into(), Value::String(memory.r#type.clone()));
-            object.insert(
-                "tags".into(),
-                Value::Array(
-                    memory
-                        .tags
-                        .iter()
-                        .map(|t| Value::String(t.clone()))
-                        .collect(),
-                ),
-            );
-            if let Some(score) = memory.score {
-                if let Some(number) = Number::from_f64(score as f64) {
-                    object.insert("score".into(), Value::Number(number));
-                }
+        fn upsert_batch(&self, memories: &[Memory]) -> Result<(), TantivyIndexError> {
+            if memories.is_empty() {
+                return Ok(());
             }
-            object.insert("project".into(), Value::String(self.project.clone()));
-            object.insert(
-                "created_at".into(),
-                Value::Number(Number::from(memory.created_at.timestamp())),
-            );
-            object.insert(
-                "updated_at".into(),
-                Value::Number(Number::from(memory.updated_at.timestamp())),
-            );
 
-            let reader = documents_batch_reader_from_objects([object]);
+            let mut objects = Vec::with_capacity(memories.len());
+            for memory in memories {
+                let mut object = JsonMap::new();
+                object.insert("id".into(), Value::String(memory.id.clone()));
+                object.insert("title".into(), Value::String(memory.title.clone()));
+                object.insert("content".into(), Value::String(memory.content.clone()));
+                object.insert("type".into(), Value::String(memory.r#type.clone()));
+                object.insert(
+                    "tags".into(),
+                    Value::Array(
+                        memory
+                            .tags
+                            .iter()
+                            .map(|t| Value::String(t.clone()))
+                            .collect(),
+                    ),
+                );
+                if let Some(score) = memory.score {
+                    if let Some(number) = Number::from_f64(score as f64) {
+                        object.insert("score".into(), Value::Number(number));
+                    }
+                }
+                object.insert("project".into(), Value::String(self.project.clone()));
+                object.insert(
+                    "created_at".into(),
+                    Value::Number(Number::from(memory.created_at.timestamp())),
+                );
+                object.insert(
+                    "updated_at".into(),
+                    Value::Number(Number::from(memory.updated_at.timestamp())),
+                );
+                objects.push(object);
+            }
+
+            let reader = documents_batch_reader_from_objects(objects);
 
             let mut wtxn = self
                 .index
@@ -360,6 +420,17 @@ mod engine {
                 .write_txn()
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
             self.delete_batch(&mut wtxn, &[external_id.to_string()])?;
+            wtxn.commit()
+                .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
+            Ok(())
+        }
+
+        fn delete_batch_ids(&self, external_ids: &[String]) -> Result<(), TantivyIndexError> {
+            let mut wtxn = self
+                .index
+                .write_txn()
+                .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
+            self.delete_batch(&mut wtxn, external_ids)?;
             wtxn.commit()
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
             Ok(())
@@ -454,6 +525,12 @@ mod engine {
                     .map(|p| p.trim())
                     .filter(|p| !p.is_empty())
                 {
+                    let part = match part {
+                        "recency" => "updated_at:desc",
+                        "score" => "score:desc",
+                        _ => part,
+                    };
+
                     match AscDesc::from_str(part) {
                         Ok(value) => crit.push(value),
                         Err(err) => return Err(TantivyIndexError::Internal(err.to_string())),
@@ -561,9 +638,17 @@ mod engine {
         type Error = TantivyIndexError;
 
         fn update(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
+            self.update_batch(project, &[memory.clone()])
+        }
+
+        fn update_batch(
+            &self,
+            project: &ProjectId,
+            memories: &[Memory],
+        ) -> Result<(), Self::Error> {
             match self.backend(project)? {
-                ProjectBackend::Milli(handle) => handle.upsert(memory),
-                ProjectBackend::Memory(mem) => mem.update(memory),
+                ProjectBackend::Milli(handle) => handle.upsert_batch(memories),
+                ProjectBackend::Memory(mem) => mem.update_batch(memories),
             }
         }
 
@@ -571,6 +656,13 @@ mod engine {
             match self.backend(project)? {
                 ProjectBackend::Milli(handle) => handle.delete(id),
                 ProjectBackend::Memory(mem) => mem.delete(id),
+            }
+        }
+
+        fn delete_batch(&self, project: &ProjectId, ids: &[String]) -> Result<(), Self::Error> {
+            match self.backend(project)? {
+                ProjectBackend::Milli(handle) => handle.delete_batch_ids(ids),
+                ProjectBackend::Memory(mem) => mem.delete_batch(ids),
             }
         }
 
@@ -659,30 +751,51 @@ mod engine {
     impl Index for TantivyIndex {
         type Error = TantivyIndexError;
 
-        fn update(&self, _project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
+        fn update(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
+            self.update_batch(project, &[memory.clone()])
+        }
+
+        fn update_batch(
+            &self,
+            _project: &ProjectId,
+            memories: &[Memory],
+        ) -> Result<(), Self::Error> {
             let mut writer = self.writer.write();
-            // delete existing
-            writer.delete_term(Term::from_field_text(self.id_f, &memory.id));
-            // add new doc
-            let mut tags_joined = String::new();
-            if !memory.tags.is_empty() {
-                tags_joined = memory.tags.join(" ");
+            for memory in memories {
+                // delete existing
+                writer.delete_term(Term::from_field_text(self.id_f, &memory.id));
+                // add new doc
+                let mut tags_joined = String::new();
+                if !memory.tags.is_empty() {
+                    tags_joined = memory.tags.join(" ");
+                }
+                let score = memory.score.unwrap_or(0.0) as f64;
+                let created_ts = memory.created_at.timestamp();
+                let updated_ts = memory.updated_at.timestamp();
+                writer
+                    .add_document(doc!(
+                        self.id_f => memory.id.clone(),
+                        self.title_f => memory.title.clone(),
+                        self.content_f => memory.content.clone(),
+                        self.tags_f => tags_joined,
+                        self.type_f => memory.r#type.clone(),
+                        self.score_f => score,
+                        self.created_ts_f => created_ts,
+                        self.updated_ts_f => updated_ts
+                    ))
+                    .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
             }
-            let score = memory.score.unwrap_or(0.0) as f64;
-            let created_ts = memory.created_at.timestamp();
-            let updated_ts = memory.updated_at.timestamp();
             writer
-                .add_document(doc!(
-                    self.id_f => memory.id.clone(),
-                    self.title_f => memory.title.clone(),
-                    self.content_f => memory.content.clone(),
-                    self.tags_f => tags_joined,
-                    self.type_f => memory.r#type.clone(),
-                    self.score_f => score,
-                    self.created_ts_f => created_ts,
-                    self.updated_ts_f => updated_ts
-                ))
+                .commit()
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;
+            Ok(())
+        }
+
+        fn delete_batch(&self, _project: &ProjectId, ids: &[String]) -> Result<(), Self::Error> {
+            let mut writer = self.writer.write();
+            for id in ids {
+                writer.delete_term(Term::from_field_text(self.id_f, id));
+            }
             writer
                 .commit()
                 .map_err(|e| TantivyIndexError::Internal(e.to_string()))?;

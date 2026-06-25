@@ -93,6 +93,19 @@ where
     }
 }
 
+pub fn measure_save_batch<S, I>(storage: &S, index: &I, project: &ProjectId, memories: &[Memory])
+where
+    S: Storage,
+    I: Index,
+{
+    for memory in memories {
+        storage.save(project, memory).expect("storage save");
+    }
+    index
+        .update_batch(project, memories)
+        .expect("index update batch");
+}
+
 pub fn save_with_timing<S, I>(
     storage: &S,
     index: &I,

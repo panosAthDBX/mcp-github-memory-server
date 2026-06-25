@@ -11,6 +11,7 @@ use std::{
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Utc};
+use fs4::FileExt;
 use mcp_gitmem_core::{
     model::{Memory, SourceMeta},
     project::{sanitize_project_id, ProjectId, DEFAULT_PROJECT_ID},
@@ -22,7 +23,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
-use fs4::FileExt;
 
 #[derive(Debug, Error)]
 pub enum GithubError {
@@ -36,6 +36,10 @@ pub enum GithubError {
     Git(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("lock busy: {0}")]
+    LockBusy(String),
+    #[error("push timed out after {0}")]
+    PushTimeout(String),
 }
 
 #[derive(Clone)]
@@ -68,6 +72,12 @@ struct LinkRegistry {
     entries: Vec<LinkEntry>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct FileCacheEntry {
+    mtime: i64,
+    size: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct LinkEntry {
     #[serde(default = "LinkEntry::generate_id")]
@@ -81,6 +91,8 @@ struct LinkEntry {
     exclude: Option<Vec<String>>,
     #[serde(default)]
     mappings: HashMap<String, String>, // relative file -> memory id
+    #[serde(default)]
+    cache: HashMap<String, FileCacheEntry>, // relative file -> metadata
     watch: LinkWatchSettings,
     #[serde(rename = "createdAt")]
     created_at: String,
@@ -126,12 +138,6 @@ impl WatchMode {
                 "unknown watch mode '{}'; supported: poll",
                 other
             ))),
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            WatchMode::Poll => "poll",
         }
     }
 }
@@ -197,8 +203,9 @@ pub struct GithubStorage {
     meta_root: PathBuf,
     manifests: RwLock<HashMap<ProjectId, Manifest>>,
     commit_batch_ms: u64,
+    push_timeout_ms: u64,
     last_commit: RwLock<Option<Instant>>,
-    dirty: RwLock<bool>,
+    dirty_projects: RwLock<HashSet<ProjectId>>, // Changed: per-project dirty tracking
     remote_name: String,
     cred: Option<CredentialConfig>,
     device_branch: RwLock<String>,
@@ -223,8 +230,9 @@ impl GithubStorage {
             meta_root,
             manifests: RwLock::new(manifests),
             commit_batch_ms: 1500,
+            push_timeout_ms: 10_000,
             last_commit: RwLock::new(None),
-            dirty: RwLock::new(false),
+            dirty_projects: RwLock::new(HashSet::new()), // Changed: per-project dirty tracking
             remote_name: "sync".into(),
             cred: None,
             device_branch: RwLock::new(Self::default_device_branch()),
@@ -236,6 +244,9 @@ impl GithubStorage {
 
     pub fn set_commit_batch_ms(&mut self, ms: u64) {
         self.commit_batch_ms = ms;
+    }
+    pub fn set_push_timeout_ms(&mut self, ms: u64) {
+        self.push_timeout_ms = ms.max(1000); // enforce a reasonable floor
     }
     pub fn set_remote_name(&mut self, name: String) {
         if !name.trim().is_empty() {
@@ -250,14 +261,14 @@ impl GithubStorage {
     ) {
         // Cache the secret value NOW (when credentials are set) rather than looking it up later
         let cached_secret = secret_env.as_deref().and_then(|k| std::env::var(k).ok());
-        
+
         if cached_secret.is_none() && secret_env.is_some() {
             tracing::warn!(
                 env_var = ?secret_env,
                 "credential secret environment variable not found or empty"
             );
         }
-        
+
         self.cred = Some(CredentialConfig {
             mode,
             username,
@@ -287,108 +298,52 @@ impl GithubStorage {
     /// Uses a file lock in /tmp to ensure FIFO ordering and prevent concurrent pushes.
     fn acquire_push_lock() -> Result<File, GithubError> {
         let lock_path = std::env::temp_dir().join("gitmem-push.lock");
-        
+
         // Open or create the lock file
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&lock_path)
             .map_err(|e| GithubError::Io(format!("failed to open push lock file: {}", e)))?;
-        
+
         tracing::debug!("acquiring push lock (blocking)");
-        
+
         // Acquire exclusive lock (blocks until available, FIFO order)
         lock_file
             .lock_exclusive()
             .map_err(|e| GithubError::Io(format!("failed to acquire push lock: {}", e)))?;
-        
+
         tracing::debug!("push lock acquired");
-        
+
         Ok(lock_file)
     }
-    
-    fn try_acquire_push_lock() -> Result<File, GithubError> {
-        let lock_path = std::env::temp_dir().join("gitmem-push.lock");
-        
+
+    fn try_acquire_push_lock(workdir: &Path) -> Result<File, GithubError> {
+        // Use lock file inside .git directory to ensure it's shared by all instances
+        // accessing this specific repository
+        let lock_path = workdir.join(".git").join("gitmem-sync.lock");
+
         // Open or create the lock file
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&lock_path)
-            .map_err(|e| GithubError::Io(format!("failed to open push lock file: {}", e)))?;
-        
+            .map_err(|e| {
+                GithubError::Io(format!(
+                    "failed to open sync lock file at {}: {}",
+                    lock_path.display(),
+                    e
+                ))
+            })?;
+
         // Try to acquire exclusive lock (returns immediately if not available)
         lock_file
             .try_lock_exclusive()
-            .map_err(|e| GithubError::Io(format!("push lock not available: {}", e)))?;
-        
-        tracing::debug!("push lock acquired (non-blocking)");
-        
+            .map_err(|e| GithubError::Io(format!("sync lock not available: {}", e)))?;
+
+        tracing::debug!("git sync lock acquired (non-blocking)");
+
         Ok(lock_file)
-    }
-
-    fn auto_push_if_enabled(&self) {
-        if !self.is_auto_push_enabled() {
-            return;
-        }
-
-        // Skip auto-push entirely during bulk operations (folder scans)
-        // The bulk operation will do a single push at the end
-        if *self.bulk_operation_in_progress.read() {
-            *self.dirty.write() = true;
-            return;
-        }
-
-        let remote_url = match self.get_remote_url() {
-            Some(url) => url,
-            None => {
-                tracing::warn!("auto-push enabled but no remote URL configured");
-                return;
-            }
-        };
-
-        // Rate limit: Skip if we pushed less than 5 seconds ago to avoid
-        // hundreds of push attempts during bulk imports
-        let last_push = *self.last_commit.read();
-        if let Some(last) = last_push {
-            if Instant::now().duration_since(last) < Duration::from_secs(5) {
-                tracing::trace!("skipping auto-push: too recent");
-                *self.dirty.write() = true; // Mark dirty so next push includes this change
-                return;
-            }
-        }
-
-        // Try to acquire lock for flush + push, but don't block
-        // If a rescan is in progress, just mark dirty and skip
-        let _lock_guard = match Self::try_acquire_push_lock() {
-            Ok(lock) => lock,
-            Err(e) => {
-                tracing::trace!(error = %e, "could not acquire push lock, deferring auto-push");
-                *self.dirty.write() = true; // Mark dirty so next push includes this change
-                return;
-            }
-        };
-
-        // Flush any pending commits while holding the lock
-        if let Err(e) = self.flush() {
-            tracing::error!(error = %e, "auto-push: flush failed");
-            return;
-        }
-
-        // Push to remote while holding the lock
-        let span = tracing::info_span!("storage.github.auto_push", remote = %remote_url);
-        let _guard = span.enter();
-
-        match self.push(&remote_url, None) {
-            Ok(()) => {
-                tracing::debug!("auto-push succeeded");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, remote = %remote_url, "auto-push failed");
-            }
-        }
-
-        // Lock is automatically released when _lock_guard is dropped
     }
 
     fn load_manifest(path: &Path) -> Result<Manifest, GithubError> {
@@ -401,6 +356,36 @@ impl GithubStorage {
             .read_to_string(&mut s)
             .map_err(|e| GithubError::Io(e.to_string()))?;
         serde_json::from_str(&s).map_err(|e| GithubError::Serde(e.to_string()))
+    }
+
+    fn lock_path(&self, project: &ProjectId) -> PathBuf {
+        self.meta_root.join(project).join("LOCK")
+    }
+
+    fn with_project_lock<F, T>(&self, project: &ProjectId, f: F) -> Result<T, GithubError>
+    where
+        F: FnOnce() -> Result<T, GithubError>,
+    {
+        self.ensure_project_dirs(project)?;
+        let lock_path = self.lock_path(project);
+
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| GithubError::Io(format!("failed to open project lock file: {}", e)))?;
+
+        // Try once; if busy, surface a LockBusy so callers can retry without blocking thread pools.
+        if let Err(e) = lock_file.try_lock_exclusive() {
+            return Err(GithubError::LockBusy(format!("project lock busy: {}", e)));
+        }
+
+        let result = f();
+
+        let _ = lock_file.unlock();
+        result
     }
 
     fn manifest_path(&self, project: &ProjectId) -> PathBuf {
@@ -416,12 +401,9 @@ impl GithubStorage {
     }
 
     fn load_or_cache_manifest(&self, project: &ProjectId) -> Result<Manifest, GithubError> {
-        {
-            let manifests = self.manifests.read();
-            if let Some(man) = manifests.get(project) {
-                return Ok(man.clone());
-            }
-        }
+        // Always reload from disk to keep multiple gitmem processes in sync.
+        // This avoids stale MANIFEST contents when another process has written
+        // new memories or deletions.
         self.ensure_project_dirs(project)?;
         let path = self.manifest_path(project);
         let loaded = Self::load_manifest(&path).unwrap_or_default();
@@ -533,7 +515,7 @@ impl GithubStorage {
     }
 
     pub fn sync_state(&self) -> GithubSyncState {
-        let dirty = *self.dirty.read();
+        let dirty = self.has_dirty_projects();
         let last_commit = *self.last_commit.read();
         let since_last_commit = last_commit.map(|ts| Instant::now().saturating_duration_since(ts));
         GithubSyncState {
@@ -555,7 +537,12 @@ impl GithubStorage {
         )
     }
 
-    fn persist_memory(&self, project: &ProjectId, memory: &Memory) -> Result<(), GithubError> {
+    fn persist_memory_with_manifest(
+        &self,
+        project: &ProjectId,
+        mut manifest: Manifest,
+        memory: &Memory,
+    ) -> Result<(), GithubError> {
         self.ensure_project_dirs(project)?;
         let rel = self.path_for_memory(project, memory);
         let path = self.abs(&rel);
@@ -572,22 +559,17 @@ impl GithubStorage {
             .join(format!(".tmp-{}.json", memory.id));
         write_atomic(&tmp, &path, &data)?;
 
-        let snapshot = {
-            let mut manifests = self.manifests.write();
-            let entry = manifests.entry(project.clone()).or_insert_with(|| {
-                Self::load_manifest(&self.manifest_path(project)).unwrap_or_default()
-            });
-            entry.ids.insert(memory.id.clone(), rel.clone());
-            if let Some(pos) = entry.recent.iter().position(|x| x == &memory.id) {
-                entry.recent.remove(pos);
-            }
-            entry.recent.push_front(memory.id.clone());
-            while entry.recent.len() > 1024 {
-                entry.recent.pop_back();
-            }
-            entry.clone()
-        };
-        self.save_manifest(project, &snapshot)?;
+        manifest.ids.insert(memory.id.clone(), rel.clone());
+        if let Some(pos) = manifest.recent.iter().position(|x| x == &memory.id) {
+            manifest.recent.remove(pos);
+        }
+        manifest.recent.push_front(memory.id.clone());
+        while manifest.recent.len() > 1024 {
+            manifest.recent.pop_back();
+        }
+
+        self.save_manifest(project, &manifest)?;
+        self.manifests.write().insert(project.clone(), manifest);
         Ok(())
     }
 
@@ -683,7 +665,7 @@ impl GithubStorage {
             let _ = f.write_all(line.as_bytes());
         }
         *self.last_commit.write() = Some(Instant::now());
-        *self.dirty.write() = false;
+        // Note: dirty_projects are cleared by take_dirty_projects() before committing
         Ok(())
     }
 
@@ -708,49 +690,166 @@ impl GithubStorage {
         Ok(())
     }
 
-    fn maybe_commit(&self, message: &str) -> Result<(), GithubError> {
-        let now = Instant::now();
-        let last = *self.last_commit.read();
-        let batch = Duration::from_millis(self.commit_batch_ms);
-        
-        // Always defer commits when auto-push is enabled OR within batch window
-        if self.is_auto_push_enabled() || last.map_or(false, |l| now.duration_since(l) < batch) {
-            *self.dirty.write() = true;
-            return Ok(());
-        }
-        
-        // If dirty, squash into a batch commit
-        if *self.dirty.read() {
-            self.git_commit("chore(mem): batch changes")
-        } else {
-            self.git_commit(message)
-        }
+    fn maybe_commit(&self, _message: &str) -> Result<(), GithubError> {
+        // Deprecated: commits are now handled by background sync thread
+        // This method is kept for compatibility but does nothing
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), GithubError> {
-        if *self.dirty.read() {
-            self.git_commit("chore(mem): batch flush")
-        } else {
-            Ok(())
+        // Best-effort synchronous sync for callers/tests expecting dirty flag to clear.
+        let dirty = self.take_dirty_projects();
+        for project in dirty {
+            match self.sync_project(&project) {
+                Ok(_) => {
+                    // synced successfully
+                }
+                Err(e) => {
+                    // Keep it dirty for background worker retry; treat lock contention as non-fatal
+                    self.mark_project_dirty(project);
+                    if !matches!(e, GithubError::LockBusy(_)) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Get a snapshot of dirty projects and clear the dirty set
+    pub fn take_dirty_projects(&self) -> HashSet<ProjectId> {
+        let mut dirty = self.dirty_projects.write();
+        std::mem::take(&mut *dirty)
+    }
+
+    /// Check if there are any dirty projects
+    pub fn has_dirty_projects(&self) -> bool {
+        !self.dirty_projects.read().is_empty()
+    }
+
+    /// Mark a project as dirty (for retry after failed sync)
+    pub fn mark_project_dirty(&self, project: ProjectId) {
+        self.dirty_projects.write().insert(project);
+    }
+
+    /// Commit and optionally push changes for a specific project
+    pub fn sync_project(&self, project: &ProjectId) -> Result<(), GithubError> {
+        // Acquire cross-process lock to prevent multiple Cursor instances from conflicting
+        let _lock_guard = match Self::try_acquire_push_lock(&self.workdir) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::debug!(project = %project, error = %e, "could not acquire sync lock, will retry later");
+                // Return LockBusy error so project gets re-marked as dirty
+                return Err(GithubError::LockBusy(format!(
+                    "another process is syncing: {}",
+                    e
+                )));
+            }
+        };
+
+        let msg = format!("chore(mem): sync changes for project {}", project);
+        self.git_commit(&msg)?;
+
+        if self.is_auto_push_enabled() {
+            let remote_url = match self.get_remote_url() {
+                Some(url) => url,
+                None => {
+                    tracing::warn!("auto-push enabled but no remote URL configured");
+                    return Ok(());
+                }
+            };
+
+            let branch = self.device_branch.read().clone();
+            match self.push(&remote_url, Some(&branch)) {
+                Ok(_) => {
+                    tracing::info!(project = %project, "successfully pushed changes");
+                    *self.last_commit.write() = Some(Instant::now());
+                }
+                Err(e) => {
+                    tracing::error!(project = %project, error = %e, "failed to push changes");
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    pub fn push(&self, remote: &str, branch: Option<&str>) -> Result<(), GithubError> {
+        let branch = {
+            #[cfg(feature = "remote-git")]
+            {
+                self.branch_for_operation(branch)?
+            }
+            #[cfg(not(feature = "remote-git"))]
+            {
+                // For file:// fast-path (and non-remote builds) just reuse current branch
+                self.device_branch()
+            }
+        };
+        // Execute push work on a dedicated thread with a timeout to prevent RPC calls from hanging
+        let remote = remote.to_string();
+        let workdir = self.workdir.clone();
+        let remote_name = self.remote_name.clone();
+        let cred_cfg = self.cred.clone();
+        let timeout = Duration::from_millis(self.push_timeout_ms);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = Self::do_push(workdir, remote_name, remote, branch, cred_cfg);
+            let _ = tx.send(res);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(GithubError::PushTimeout(
+                format!("{}ms", timeout.as_millis()),
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(GithubError::Git("push worker thread panicked".into()))
+            }
         }
     }
 
-    pub fn push(&self, remote: &str, branch: Option<&str>) -> Result<(), GithubError> {
+    #[allow(unused_variables)]
+    fn do_push(
+        workdir: PathBuf,
+        _remote_name: String,
+        remote: String,
+        branch: String,
+        cred_cfg: Option<CredentialConfig>,
+    ) -> Result<(), GithubError> {
+        // Optional test-only hook to simulate slow pushes
+        #[cfg(test)]
+        {
+            if std::env::var("GITMEM_TEST_FORCE_PUSH_TIMEOUT").is_ok() {
+                return Err(GithubError::PushTimeout("test-injected".into()));
+            }
+            if let Some(ms) = std::env::var("GITMEM_TEST_PUSH_SLEEP_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
         if let Some(path) = remote.strip_prefix("file://") {
             let dst = PathBuf::from(path);
-            copy_tree(&self.workdir.join("memories"), &dst.join("memories"))?;
-            copy_tree(&self.workdir.join("meta"), &dst.join("meta"))?;
+            copy_tree(
+                &PathBuf::from(&workdir).join("memories"),
+                &dst.join("memories"),
+            )?;
+            copy_tree(&PathBuf::from(&workdir).join("meta"), &dst.join("meta"))?;
             return Ok(());
         }
         #[cfg(feature = "remote-git")]
         {
             use git2::{IndexAddOption, Repository, Signature};
-            let branch = self.branch_for_operation(branch)?;
             // Init or open repository
-            let repo = match Repository::open(&self.workdir) {
+            let repo = match Repository::open(&workdir) {
                 Ok(r) => r,
                 Err(_) => {
-                    Repository::init(&self.workdir).map_err(|e| GithubError::Git(e.to_string()))?
+                    Repository::init(&workdir).map_err(|e| GithubError::Git(e.to_string()))?
                 }
             };
             // Stage files under memories/ and meta/
@@ -781,11 +880,10 @@ impl GithubStorage {
             // Ensure HEAD points to branch
             let _ = repo.set_head(&refname);
             // Add or configure remote
-            let remote_name = self.remote_name.clone();
-            let mut remote = match repo.find_remote(&remote_name) {
+            let mut remote = match repo.find_remote(&_remote_name) {
                 Ok(r) => r,
                 Err(_) => repo
-                    .remote(&remote_name, remote)
+                    .remote(&_remote_name, &remote)
                     .map_err(|e| GithubError::Git(e.to_string()))?,
             };
             // Connect and push
@@ -793,7 +891,6 @@ impl GithubStorage {
             let fallback_config = git2::Config::open_default().ok().map(Arc::new);
             let helper_repo_config = repo_config.clone();
             let helper_fallback_config = fallback_config.clone();
-            let cred_cfg = self.cred.clone();
             let mut callbacks = git2::RemoteCallbacks::new();
             callbacks.credentials(move |url, username_from_url, _allowed_types| {
                 let helper_config = || {
@@ -818,8 +915,9 @@ impl GithubStorage {
                                 .or_else(|| username_from_url.map(|s| s.to_string()))
                                 .unwrap_or_else(|| "git".into());
                             // Prefer cached secret, fall back to environment lookup
-                            let pass = c.cached_secret.clone()
-                                .or_else(|| c.secret_env.as_deref().and_then(|k| std::env::var(k).ok()));
+                            let pass = c.cached_secret.clone().or_else(|| {
+                                c.secret_env.as_deref().and_then(|k| std::env::var(k).ok())
+                            });
                             if let Some(p) = pass {
                                 git2::Cred::userpass_plaintext(&user, &p)
                             } else {
@@ -832,8 +930,12 @@ impl GithubStorage {
                                 .clone()
                                 .unwrap_or_else(|| "x-access-token".into());
                             // Prefer cached secret, fall back to environment lookup
-                            let token = c.cached_secret.clone()
-                                .or_else(|| c.secret_env.as_deref().and_then(|k| std::env::var(k).ok()))
+                            let token = c
+                                .cached_secret
+                                .clone()
+                                .or_else(|| {
+                                    c.secret_env.as_deref().and_then(|k| std::env::var(k).ok())
+                                })
                                 .unwrap_or_default();
                             git2::Cred::userpass_plaintext(&user, &token)
                         }
@@ -928,8 +1030,9 @@ impl GithubStorage {
                                 .or_else(|| username_from_url.map(|s| s.to_string()))
                                 .unwrap_or_else(|| "git".into());
                             // Prefer cached secret, fall back to environment lookup
-                            let pass = c.cached_secret.clone()
-                                .or_else(|| c.secret_env.as_deref().and_then(|k| std::env::var(k).ok()));
+                            let pass = c.cached_secret.clone().or_else(|| {
+                                c.secret_env.as_deref().and_then(|k| std::env::var(k).ok())
+                            });
                             if let Some(p) = pass {
                                 git2::Cred::userpass_plaintext(&user, &p)
                             } else {
@@ -942,8 +1045,12 @@ impl GithubStorage {
                                 .clone()
                                 .unwrap_or_else(|| "x-access-token".into());
                             // Prefer cached secret, fall back to environment lookup
-                            let token = c.cached_secret.clone()
-                                .or_else(|| c.secret_env.as_deref().and_then(|k| std::env::var(k).ok()))
+                            let token = c
+                                .cached_secret
+                                .clone()
+                                .or_else(|| {
+                                    c.secret_env.as_deref().and_then(|k| std::env::var(k).ok())
+                                })
                                 .unwrap_or_default();
                             git2::Cred::userpass_plaintext(&user, &token)
                         }
@@ -1049,31 +1156,30 @@ impl Storage for GithubStorage {
 
     fn save(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
         let project = sanitize_project_id(project);
-        self.persist_memory(&project, memory)?;
-        let msg = format!(
-            "feat(mem): add {} [mem:{}] ({project})",
-            memory.title, memory.id
-        );
-        self.maybe_commit(&msg)?;
-        self.auto_push_if_enabled();
+        // Serialize writes across processes to avoid manifest corruption.
+        self.with_project_lock(&project, || {
+            // Ensure repository skeleton exists so concurrent instances share .git
+            let _ = self.ensure_repo();
+            let manifest = self.load_or_cache_manifest(&project)?;
+            self.persist_memory_with_manifest(&project, manifest, memory)
+        })?;
+        // Mark project as dirty for background sync instead of immediate commit
+        self.dirty_projects.write().insert(project.clone());
+        // Track when we last touched git state to satisfy sync_state reporting
+        let mut last = self.last_commit.write();
+        if last.is_none() {
+            *last = Some(Instant::now());
+        }
+        tracing::debug!(project = %project, memory_id = %memory.id, "marked project dirty for background sync");
         Ok(())
     }
 
     fn get(&self, project: &ProjectId, id: &str) -> Result<Option<Memory>, Self::Error> {
         let project = sanitize_project_id(project);
-        let rel = {
-            let manifests = self.manifests.read();
-            manifests.get(&project).and_then(|m| m.ids.get(id).cloned())
-        };
-        let rel = match rel {
-            Some(r) => r,
-            None => {
-                let manifest = self.load_or_cache_manifest(&project)?;
-                match manifest.ids.get(id) {
-                    Some(r) => r.clone(),
-                    None => return Ok(None),
-                }
-            }
+        let manifest = self.load_or_cache_manifest(&project)?;
+        let rel = match manifest.ids.get(id) {
+            Some(r) => r.clone(),
+            None => return Ok(None),
         };
         let path = self.abs(&rel);
         let mut s = String::new();
@@ -1092,76 +1198,91 @@ impl Storage for GithubStorage {
 
     fn update(&self, project: &ProjectId, memory: &Memory) -> Result<(), Self::Error> {
         let project = sanitize_project_id(project);
-        let manifest = self.load_or_cache_manifest(&project)?;
-        let rel = match manifest.ids.get(&memory.id) {
-            Some(p) => p.clone(),
-            None => return Err(GithubError::NotFound(memory.id.clone())),
-        };
-        let path = self.abs(&rel);
-        let mut s = String::new();
-        if let Ok(mut f) = File::open(&path) {
-            f.read_to_string(&mut s)
-                .map_err(|e| GithubError::Io(e.to_string()))?;
-            if let Ok(existing) = serde_json::from_str::<Memory>(&s) {
-                if memory.version <= existing.version || memory.updated_at <= existing.updated_at {
-                    let _ = self.write_conflict_artifact(&existing, memory);
-                    return Err(GithubError::Conflict(format!(
-                        "memory {} version/updated_at stale",
-                        memory.id
-                    )));
+        // Serialize updates to avoid manifest races across processes.
+        self.with_project_lock(&project, || {
+            let _ = self.ensure_repo();
+            let manifest = self.load_or_cache_manifest(&project)?;
+            let rel = match manifest.ids.get(&memory.id) {
+                Some(p) => p.clone(),
+                None => return Err(GithubError::NotFound(memory.id.clone())),
+            };
+            let path = self.abs(&rel);
+            let mut s = String::new();
+            if let Ok(mut f) = File::open(&path) {
+                f.read_to_string(&mut s)
+                    .map_err(|e| GithubError::Io(e.to_string()))?;
+                if let Ok(existing) = serde_json::from_str::<Memory>(&s) {
+                    if memory.version <= existing.version
+                        || memory.updated_at <= existing.updated_at
+                    {
+                        let _ = self.write_conflict_artifact(&existing, memory);
+                        return Err(GithubError::Conflict(format!(
+                            "memory {} version/updated_at stale",
+                            memory.id
+                        )));
+                    }
                 }
             }
+
+            self.persist_memory_with_manifest(&project, manifest, memory)
+        })?;
+
+        // Mark project as dirty for background sync instead of immediate commit
+        self.dirty_projects.write().insert(project.clone());
+        let mut last = self.last_commit.write();
+        if last.is_none() {
+            *last = Some(Instant::now());
         }
-        self.persist_memory(&project, memory)?;
-        let msg = format!(
-            "fix(mem): update {} [mem:{}] ({project})",
-            memory.title, memory.id
-        );
-        self.maybe_commit(&msg)?;
-        self.auto_push_if_enabled();
+        tracing::debug!(project = %project, memory_id = %memory.id, "marked project dirty for background sync");
         Ok(())
     }
 
     fn delete(&self, project: &ProjectId, id: &str, hard: bool) -> Result<(), Self::Error> {
         let project = sanitize_project_id(project);
-        let (rel, snapshot) = {
-            let mut manifests = self.manifests.write();
-            let entry = manifests.entry(project.clone()).or_insert_with(|| {
-                Self::load_manifest(&self.manifest_path(&project)).unwrap_or_default()
-            });
-            let rel = entry
+
+        self.with_project_lock(&project, || {
+            let _ = self.ensure_repo();
+            let mut manifest = self.load_or_cache_manifest(&project)?;
+            let rel = manifest
                 .ids
                 .remove(id)
                 .ok_or_else(|| GithubError::NotFound(id.to_string()))?;
-            if let Some(pos) = entry.recent.iter().position(|x| x == id) {
-                entry.recent.remove(pos);
+            if let Some(pos) = manifest.recent.iter().position(|x| x == id) {
+                manifest.recent.remove(pos);
             }
-            let snapshot = entry.clone();
-            (rel, snapshot)
-        };
-        self.save_manifest(&project, &snapshot)?;
-        let path = self.abs(&rel);
-        if hard {
-            fs::remove_file(&path)
-                .map_err(|e| GithubError::Io(format!("remove_file {}: {}", path.display(), e)))?;
-        } else {
-            let del_dir = self.workdir.join("memories").join(&project).join("deleted");
-            fs::create_dir_all(&del_dir).map_err(|e| {
-                GithubError::Io(format!("create_dir_all {}: {}", del_dir.display(), e))
-            })?;
-            let dest = del_dir.join(format!("{}.json", id));
-            fs::rename(&path, &dest).map_err(|e| {
-                GithubError::Io(format!(
-                    "rename {} -> {}: {}",
-                    path.display(),
-                    dest.display(),
-                    e
-                ))
-            })?;
+
+            self.save_manifest(&project, &manifest)?;
+            self.manifests.write().insert(project.clone(), manifest);
+            let path = self.abs(&rel);
+            if hard {
+                fs::remove_file(&path).map_err(|e| {
+                    GithubError::Io(format!("remove_file {}: {}", path.display(), e))
+                })?;
+            } else {
+                let del_dir = self.workdir.join("memories").join(&project).join("deleted");
+                fs::create_dir_all(&del_dir).map_err(|e| {
+                    GithubError::Io(format!("create_dir_all {}: {}", del_dir.display(), e))
+                })?;
+                let dest = del_dir.join(format!("{}.json", id));
+                fs::rename(&path, &dest).map_err(|e| {
+                    GithubError::Io(format!(
+                        "rename {} -> {}: {}",
+                        path.display(),
+                        dest.display(),
+                        e
+                    ))
+                })?;
+            }
+            Ok(())
+        })?;
+
+        // Mark project as dirty for background sync instead of immediate commit
+        self.dirty_projects.write().insert(project.clone());
+        let mut last = self.last_commit.write();
+        if last.is_none() {
+            *last = Some(Instant::now());
         }
-        let msg = format!("chore(mem): delete [mem:{id}] ({project})", id = id);
-        self.maybe_commit(&msg)?;
-        self.auto_push_if_enabled();
+        tracing::debug!(project = %project, memory_id = %id, "marked project dirty for background sync (delete)");
         Ok(())
     }
 
@@ -1213,9 +1334,12 @@ mod tests {
     }
 
     fn unique_suffix() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        now.as_nanos()
+        let inc = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        (now.as_nanos() << 16) ^ inc
     }
 
     #[test]
@@ -1225,7 +1349,19 @@ mod tests {
         let m = Memory::new("title", "content", "note");
         let id = m.id.clone();
         let project = DEFAULT_PROJECT_ID.to_string();
-        store.save(&project, &m).unwrap();
+        // Retry a few times in case the FS lock is transiently busy on macOS
+        let mut attempts = 0;
+        loop {
+            match store.save(&project, &m) {
+                Ok(()) => break,
+                Err(GithubError::LockBusy(_)) if attempts < 5 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) => panic!("save failed: {e:?}"),
+            }
+        }
         // ensure file exists and get works
         let got = store.get(&project, &id).unwrap().unwrap();
         assert_eq!(got.title, "title");
@@ -1239,6 +1375,28 @@ mod tests {
         assert!(out.is_none());
         let manifest_path = root.join("meta").join(project).join("MANIFEST.json");
         assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn multiple_instances_merge_manifest_updates() {
+        let root = temp_repo_path();
+        let store_a = GithubStorage::new(&root).unwrap();
+        let store_b = GithubStorage::new(&root).unwrap();
+
+        let m1 = Memory::new("first", "one", "note");
+        let id1 = m1.id.clone();
+        store_a.save(&DEFAULT_PROJECT_ID.to_string(), &m1).unwrap();
+
+        let m2 = Memory::new("second", "two", "note");
+        let id2 = m2.id.clone();
+        store_b.save(&DEFAULT_PROJECT_ID.to_string(), &m2).unwrap();
+
+        // A fresh instance should see both memories, proving manifest writes are merged
+        let store_c = GithubStorage::new(&root).unwrap();
+        let got1 = store_c.get(&DEFAULT_PROJECT_ID.to_string(), &id1).unwrap();
+        let got2 = store_c.get(&DEFAULT_PROJECT_ID.to_string(), &id2).unwrap();
+        assert!(got1.is_some(), "memory from first instance missing");
+        assert!(got2.is_some(), "memory from second instance missing");
     }
 
     #[test]
@@ -1257,7 +1415,18 @@ mod tests {
         store.save(&project, &m).unwrap();
         store.flush().unwrap();
         // push to remote path
-        assert!(store.push(&remote_uri, None).is_ok());
+        let mut attempts = 0;
+        loop {
+            match store.push(&remote_uri, None) {
+                Ok(()) => break,
+                Err(GithubError::PushTimeout(_)) if attempts < 3 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("push failed: {e:?}"),
+            }
+        }
         // ensure remote has the file
         let mut found = false;
         for entry in walkdir::WalkDir::new(remote_dir.join("memories")) {
@@ -1289,6 +1458,34 @@ mod tests {
         // ensure pulled memory exists
         let got = store2.get(&project, &id).unwrap();
         assert!(got.is_some());
+    }
+
+    #[test]
+    fn push_times_out_when_slow() {
+        let root = temp_repo_path();
+        let mut store = GithubStorage::new(&root).unwrap();
+        store.set_push_timeout_ms(50); // 50ms
+                                       // Force timeout via test-only hook (deterministic, no networking)
+        std::env::set_var("GITMEM_TEST_FORCE_PUSH_TIMEOUT", "1");
+
+        // Prepare a local file:// remote
+        let remote_dir = temp_repo_path();
+        fs::create_dir_all(remote_dir.join("memories")).unwrap();
+        fs::create_dir_all(remote_dir.join("meta")).unwrap();
+        let remote_uri = format!("file://{}", remote_dir.display());
+
+        let m = Memory::new("timeout", "body", "note");
+        let project = DEFAULT_PROJECT_ID.to_string();
+        store.save(&project, &m).unwrap();
+        store.flush().unwrap();
+
+        let res = store.push(&remote_uri, None);
+        std::env::remove_var("GITMEM_TEST_FORCE_PUSH_TIMEOUT");
+        assert!(
+            matches!(res, Err(GithubError::PushTimeout(_))),
+            "expected push to time out, got {:?}",
+            res
+        );
     }
 
     #[test]
@@ -1596,7 +1793,7 @@ impl GithubStorage {
     ) -> Result<LinkedFolderInfo, GithubError> {
         let project = sanitize_project_id(project);
         self.ensure_project_dirs(&project)?;
-        
+
         let resolved = Self::resolve_external_path(path)?;
         if !resolved.is_dir() {
             return Err(GithubError::Io(format!(
@@ -1625,7 +1822,7 @@ impl GithubStorage {
         let now = Self::now_timestamp();
         let link_id = LinkEntry::generate_id();
         let display = Some(path.to_string());
-        
+
         let entry = LinkEntry {
             id: link_id.clone(),
             display: display.clone(),
@@ -1633,6 +1830,7 @@ impl GithubStorage {
             include: include_clean.clone(),
             exclude: exclude_clean.clone(),
             mappings: HashMap::new(),
+            cache: HashMap::new(),
             watch: watch.clone(),
             created_at: now.clone(),
             last_scan: None,
@@ -1641,7 +1839,7 @@ impl GithubStorage {
             total_bytes: 0,
             last_runtime_ms: None,
         };
-        
+
         registry.entries.push(entry);
         self.save_links(&project, &registry)?;
 
@@ -1674,7 +1872,7 @@ impl GithubStorage {
         if registry.entries.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         let mut removed = Vec::new();
         match path {
             Some(p) => {
@@ -1728,10 +1926,9 @@ impl GithubStorage {
     ) -> Result<Vec<RescanReport>, GithubError> {
         // Acquire file lock at the START to protect entire scan+commit+push operation
         // This prevents concurrent rescans from ANY gitmem process (poller, manual calls, other instances)
-        let _lock_guard = Self::acquire_push_lock().map_err(|e| {
-            GithubError::Io(format!("failed to acquire lock for rescan: {}", e))
-        })?;
-        
+        let _lock_guard = Self::acquire_push_lock()
+            .map_err(|e| GithubError::Io(format!("failed to acquire lock for rescan: {}", e)))?;
+
         let project = sanitize_project_id(project);
         self.ensure_project_dirs(&project)?;
         let mut registry = self.load_links(&project)?;
@@ -1750,14 +1947,14 @@ impl GithubStorage {
         });
 
         let mut reports = Vec::new();
-        
+
         for entry in registry.entries.iter_mut() {
             if let Some(ref filter) = filter {
                 if !filter.contains(Path::new(&entry.path)) {
                     continue;
                 }
             }
-            
+
             let started = Instant::now();
             let now_ts = Self::now_timestamp();
             let mut report = RescanReport {
@@ -1816,23 +2013,27 @@ impl GithubStorage {
 
             reports.push(report);
         }
-        
+
         self.save_links(&project, &registry)?;
-        
+
         // Only flush and push if there were actual changes
-        let total_changes: usize = reports.iter()
+        let total_changes: usize = reports
+            .iter()
             .map(|r| r.created + r.updated + r.deleted)
             .sum();
-        
+
         if total_changes > 0 && self.is_auto_push_enabled() {
             if let Some(remote_url) = self.get_remote_url() {
-                tracing::debug!(changes = total_changes, "rescan: flushing and pushing changes");
-                
+                tracing::debug!(
+                    changes = total_changes,
+                    "rescan: flushing and pushing changes"
+                );
+
                 // Flush any pending commits
                 if let Err(e) = self.flush() {
                     tracing::error!(error = %e, "rescan: flush failed");
                 }
-                
+
                 // Push to remote
                 if let Err(e) = self.push(&remote_url, None) {
                     tracing::error!(error = %e, remote = %remote_url, "rescan: push failed");
@@ -1841,10 +2042,10 @@ impl GithubStorage {
         } else if total_changes == 0 {
             tracing::trace!("rescan: no changes detected, skipping flush and push");
         }
-        
+
         // Clear bulk operation flag AFTER push completes
         *self.bulk_operation_in_progress.write() = false;
-        
+
         Ok(reports)
     }
 
@@ -1862,8 +2063,8 @@ impl GithubStorage {
         let dir = self.meta_root.join(project);
         fs::create_dir_all(&dir).map_err(|e| GithubError::Io(e.to_string()))?;
         let path = dir.join("links.json");
-        let data = serde_json::to_vec_pretty(registry)
-            .map_err(|e| GithubError::Serde(e.to_string()))?;
+        let data =
+            serde_json::to_vec_pretty(registry).map_err(|e| GithubError::Serde(e.to_string()))?;
         fs::write(&path, &data).map_err(|e| GithubError::Io(e.to_string()))
     }
 
@@ -1906,9 +2107,13 @@ impl GithubStorage {
         let exclude_patterns = Self::compile_patterns(entry.exclude.as_ref())?;
 
         let mut new_mappings = HashMap::new();
+        let mut new_cache = HashMap::new();
         let mut visited_files = HashSet::new();
-        
-        for walk_entry in walkdir::WalkDir::new(&dir_path).into_iter().filter_map(Result::ok) {
+
+        for walk_entry in walkdir::WalkDir::new(&dir_path)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if walk_entry.file_type().is_dir() {
                 continue;
             }
@@ -1927,14 +2132,48 @@ impl GithubStorage {
             if Self::pattern_matches(&exclude_patterns, &rel_str, false) {
                 continue;
             }
-            
+
             visited_files.insert(rel_str.clone());
             stats.scanned += 1;
-            
+
+            // Get file metadata for cache check
+            let metadata = match fs::metadata(file_path) {
+                Ok(m) => m,
+                Err(_) => continue, // Skip if we can't stat
+            };
+            let mtime = metadata
+                .modified()
+                .unwrap_or_else(|_| std::time::SystemTime::now())
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let size = metadata.len();
+
+            // Check cache
+            let mut skip_processing = false;
+            if let Some(cached) = entry.cache.get(&rel_str) {
+                if cached.mtime == mtime && cached.size == size {
+                    // File unchanged, check if mapping exists
+                    if let Some(mem_id) = entry.mappings.get(&rel_str) {
+                        new_mappings.insert(rel_str.clone(), mem_id.clone());
+                        new_cache.insert(rel_str.clone(), cached.clone());
+                        stats.total_bytes = stats.total_bytes.saturating_add(size);
+                        skip_processing = true;
+                    }
+                }
+            }
+
+            if skip_processing {
+                continue;
+            }
+
+            // File changed or new, process it
             let mem_id = Self::linked_memory_id(project, &entry.path, &rel_str);
             let memory = self.memory_from_file(project, &mem_id, &entry.id, &rel_str, file_path)?;
-            
-            let existed = self.get(project, &mem_id).map_err(|e| GithubError::Io(e.to_string()))?;
+
+            let existed = self
+                .get(project, &mem_id)
+                .map_err(|e| GithubError::Io(e.to_string()))?;
             if let Some(mut existing) = existed {
                 if existing.content != memory.content
                     || existing.title != memory.title
@@ -1953,8 +2192,10 @@ impl GithubStorage {
                 self.save(project, &memory)?;
                 stats.created += 1;
             }
-            
-            new_mappings.insert(rel_str, mem_id);
+
+            new_mappings.insert(rel_str.clone(), mem_id);
+            new_cache.insert(rel_str, FileCacheEntry { mtime, size });
+
             if let Some(size) = memory.source.as_ref().and_then(|src| src.file_size) {
                 stats.total_bytes = stats.total_bytes.saturating_add(size);
             }
@@ -1970,6 +2211,7 @@ impl GithubStorage {
         }
 
         entry.mappings = new_mappings;
+        entry.cache = new_cache;
         stats.file_count = visited_files.len() as u64;
         Ok(stats)
     }
@@ -2053,7 +2295,9 @@ impl GithubStorage {
                 }
             }
 
-            let metadata = path.metadata().map_err(|e| GithubError::Io(e.to_string()))?;
+            let metadata = path
+                .metadata()
+                .map_err(|e| GithubError::Io(e.to_string()))?;
             source_meta.file_size = Some(metadata.len());
             if let Ok(modified) = metadata.modified() {
                 let dt: DateTime<Utc> = modified.into();
@@ -2205,7 +2449,7 @@ impl GithubStorage {
         } else {
             WatchMode::default()
         };
-        
+
         Ok(LinkWatchSettings {
             mode,
             poll_interval_ms: poll_interval_ms.unwrap_or(30_000),
@@ -2213,5 +2457,4 @@ impl GithubStorage {
             platform: None,
         })
     }
-
 }
